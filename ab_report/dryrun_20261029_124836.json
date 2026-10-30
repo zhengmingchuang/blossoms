@@ -1,0 +1,16 @@
+[
+  {
+    "case": "city100",
+    "dry_run": true,
+    "columns": [
+      "城市名",
+      "GDP总量（亿元）",
+      "常住人口（万）",
+      "人均GDP（元）",
+      "一般公共预算收入（亿元）"
+    ],
+    "batches": 5,
+    "source_chars": 11315,
+    "baseline_rows": 100
+  }
+]
