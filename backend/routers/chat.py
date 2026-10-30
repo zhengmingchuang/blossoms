@@ -189,6 +189,8 @@ def delete_session(
     )
     if not chat_sess:
         raise HTTPException(status_code=404, detail="会话不存在")
+    # 显式清理消息：SQLite 的外键级联依赖 PRAGMA，历史上未开启时留下了孤儿行
+    db.query(ChatMessage).filter(ChatMessage.session_id == session_id).delete(synchronize_session=False)
     db.delete(chat_sess)
     db.commit()
     return {"ok": True}
