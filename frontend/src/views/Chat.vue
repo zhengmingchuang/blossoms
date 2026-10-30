@@ -82,11 +82,18 @@
                 <div v-for="(ta, ti) in m.toolActions" :key="ti" class="tool-action-item">
                   <span class="tool-action-name">{{ toolLabel(ta.tool) }}</span>
                   <span class="tool-action-detail" v-if="ta.input">{{ toolInputSummary(ta) }}</span>
+                  <span v-if="ta.pending" class="tool-action-state">执行中…</span>
+                  <span v-else-if="ta.ok === false" class="tool-action-state is-fail">失败</span>
                 </div>
-                <div class="tool-actions-done">处理完成</div>
+                <div class="tool-actions-done" v-if="!m.streaming">处理完成</div>
               </div>
-              <div class="msg-bubble">
-                <div v-if="m.role === 'assistant'" v-html="renderMd(m.content)" class="md-body"></div>
+              <div class="msg-bubble" :class="{ 'is-streaming': m.streaming }">
+                <template v-if="m.role === 'assistant'">
+                  <div v-if="m.streaming && !m.content" class="typing">
+                    <span></span><span></span><span></span>
+                  </div>
+                  <div v-else v-html="renderMd(m.content)" class="md-body"></div>
+                </template>
                 <div v-else>{{ m.content }}</div>
               </div>
               <div v-if="m.editedFiles && m.editedFiles.length" class="download-panel">
@@ -100,16 +107,6 @@
             </div>
           </div>
 
-          <div v-if="sending" class="msg assistant">
-            <div class="msg-avatar">
-              <span class="msg-avatar-fallback">AI</span>
-            </div>
-            <div class="msg-content">
-              <div class="msg-bubble typing">
-                <span></span><span></span><span></span>
-              </div>
-            </div>
-          </div>
         </div>
 
         <div class="input-area">
@@ -150,8 +147,11 @@
               @keyup.enter="send"
               class="chat-input"
             />
-            <el-button type="primary" :icon="Promotion" @click="send" :loading="sending" class="send-btn">
+            <el-button v-if="!sending" type="primary" :icon="Promotion" @click="send" class="send-btn">
               发送
+            </el-button>
+            <el-button v-else type="danger" :icon="VideoPause" @click="stop" class="send-btn">
+              停止
             </el-button>
           </div>
         </div>
@@ -191,7 +191,7 @@
 import { ref, computed, nextTick, onMounted } from 'vue'
 import { chatApi } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Promotion, Delete, Download, UploadFilled } from '@element-plus/icons-vue'
+import { Promotion, Delete, Download, UploadFilled, VideoPause } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 
 const userAvatar = computed(() => {
@@ -421,33 +421,85 @@ const removeSession = async (s) => {
   }
 }
 
+let streamCtrl = null
+
+const stop = () => {
+  if (streamCtrl) streamCtrl.abort()
+}
+
 const send = async () => {
   const q = input.value.trim()
   if (!q || sending.value) return
   const selFiles = fileList.value.filter(f => selectedFileIds.value.includes(f.id))
   const prefix = selFiles.length ? `[${selFiles.map(f => f.name).join(', ')}] ` : ''
   const displayQ = prefix + q
+
+  // 历史只取当前提问之前的部分，后端会自行追加本轮用户消息
+  const history = messages.value.map(m => ({ role: m.role, content: m.content }))
+
   messages.value.push({ role: 'user', content: displayQ })
   input.value = ''
   sending.value = true
+
+  messages.value.push({ role: 'assistant', content: '', toolActions: [], streaming: true, editedFiles: null })
+  const aiMsg = messages.value[messages.value.length - 1]
   scrollBottom()
+
+  streamCtrl = new AbortController()
   try {
-    const history = messages.value.map(m => ({ role: m.role, content: m.content }))
-    const { data } = await chatApi.ask(q, history.slice(-10), currentSessionId.value, null, selectedFileIds.value)
-    const assistantMsg = { role: 'assistant', content: data.answer }
-    if (data.tool_actions && data.tool_actions.length) {
-      assistantMsg.toolActions = data.tool_actions
+    await chatApi.askStream(
+      {
+        message: q,
+        history: history.slice(-10),
+        session_id: currentSessionId.value,
+        file_ids: selectedFileIds.value,
+      },
+      {
+        signal: streamCtrl.signal,
+        onEvent: ev => {
+          if (ev.type === 'session') {
+            if (ev.session_id != null) currentSessionId.value = ev.session_id
+          } else if (ev.type === 'delta') {
+            aiMsg.content += ev.text
+            scrollBottom()
+          } else if (ev.type === 'tool_start') {
+            aiMsg.toolActions.push({ tool: ev.tool, input: ev.input, pending: true })
+            scrollBottom()
+          } else if (ev.type === 'tool_end') {
+            const running = [...aiMsg.toolActions].reverse().find(t => t.tool === ev.tool && t.pending)
+            if (running) {
+              running.pending = false
+              running.ok = ev.ok
+            }
+            scrollBottom()
+          } else if (ev.type === 'done') {
+            if (ev.session_id != null) currentSessionId.value = ev.session_id
+            if (!aiMsg.content && ev.answer) aiMsg.content = ev.answer
+            if (ev.edited_files && ev.edited_files.length) {
+              aiMsg.editedFiles = ev.edited_files
+              ev.edited_files.forEach(ef => addToDocHistory(ef))
+            }
+          } else if (ev.type === 'error') {
+            aiMsg.content = aiMsg.content || (ev.message || '处理失败，请稍后重试。')
+          }
+        },
+      }
+    )
+    if (!aiMsg.content) aiMsg.content = '操作已完成。'
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      aiMsg.content = aiMsg.content || '已停止生成。'
+    } else {
+      aiMsg.content = aiMsg.content || '请求失败，请检查后端服务和LLM配置。'
     }
-    if (data.edited_files && data.edited_files.length) {
-      assistantMsg.editedFiles = data.edited_files
-      data.edited_files.forEach(ef => addToDocHistory(ef))
-    }
-    messages.value.push(assistantMsg)
-    if (data.session_id != null) currentSessionId.value = data.session_id
-    await loadSessions()
-  } catch {
-    messages.value.push({ role: 'assistant', content: '请求失败，请检查后端服务和LLM配置。' })
-  } finally { sending.value = false; scrollBottom() }
+  } finally {
+    aiMsg.streaming = false
+    aiMsg.toolActions.forEach(t => { t.pending = false })
+    sending.value = false
+    streamCtrl = null
+    scrollBottom()
+    loadSessions()
+  }
 }
 
 onMounted(() => { loadSessions(); loadFiles() })
@@ -761,6 +813,40 @@ onMounted(() => { loadSessions(); loadFiles() })
 }
 .md-body :deep(ul), .md-body :deep(ol) { padding-left: 20px; margin: 4px 0; }
 .md-body :deep(li) { margin-bottom: 4px; }
+
+/* 流式输出光标：挂在最后一段内容尾部，避免整块重排 */
+.msg-bubble.is-streaming .md-body :deep(> :last-child)::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: -0.12em;
+  background: var(--primary-color);
+  border-radius: 1px;
+  animation: caret-blink 1s steps(2, start) infinite;
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* 工具执行状态 */
+.tool-action-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  animation: state-pulse 1.4s ease-in-out infinite;
+}
+.tool-action-state.is-fail {
+  color: #e24b4a;
+  animation: none;
+}
+@keyframes state-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
 
 /* 处理步骤面板 */
 .tool-actions-panel {

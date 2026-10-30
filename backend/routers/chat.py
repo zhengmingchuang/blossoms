@@ -8,7 +8,7 @@ from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,7 @@ from models import User, FileInfo, ExtractResult, ChatSession, ChatMessage, Task
 from config import UPLOAD_DIR
 from routers.auth import get_current_user
 from routers.documents import _fast_parse
-from services.llm_service import call_llm, call_llm_text
+from services.llm_service import call_llm, call_llm_text, call_llm_stream
 from services.vector_store import search as vs_search
 from services.doc_editor import AGENT_TOOLS, execute_tool
 
@@ -293,37 +293,40 @@ def _build_system_prompt(files, extracts_summary: str, has_tools: bool) -> str:
     return "\n".join(parts)
 
 
-@router.post("/ask")
-async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    query = req.message.strip()
-    if not query:
-        return {"answer": "请输入你的问题。", "session_id": req.session_id}
+# =====================  上下文构建（流式 / 非流式共用）  =====================
 
-    # ---- 会话管理 ----
-    chat_sess: Optional[ChatSession] = None
-    if req.session_id is not None:
-        chat_sess = (
-            db.query(ChatSession)
-            .filter(ChatSession.id == req.session_id, ChatSession.user_id == user.id)
-            .first()
-        )
-        if not chat_sess:
-            raise HTTPException(status_code=404, detail="会话不存在或无权访问")
-    else:
-        chat_sess = ChatSession(user_id=user.id, title=_title_from_message(query))
-        db.add(chat_sess)
-        db.commit()
-        db.refresh(chat_sess)
+_TOOL_LABELS = {
+    "search_documents": "检索文档内容",
+    "extract_info": "提取关键信息",
+    "list_files": "查询文件列表",
+    "edit_document": "编辑文档内容",
+    "analyze_document": "分析文档结构",
+    "format_document": "调整文档格式",
+    "create_spreadsheet": "创建Excel表格",
+    "format_spreadsheet": "格式化Excel表格",
+    "add_chart": "创建图表",
+    "validate_spreadsheet": "设置数据有效性",
+    "get_extract_results": "获取提取结果",
+    "fill_template_smart": "智能模板填表",
+}
 
-    # ---- 检索文档上下文 ----
+_IMAGE_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp")
+
+
+def _prepare_turn(db: Session, query: str, user_id: int, req: "ChatReq"):
+    """构建本轮对话的 system prompt 与 messages。
+
+    流式与非流式接口共用同一套上下文拼装逻辑，避免两条链路的检索结果、
+    系统提示或目标文件提示出现偏差。
+    """
     chunks = []
     try:
-        chunks = vs_search(query, 10, user_id=user.id)
+        chunks = vs_search(query, 10, user_id=user_id)
     except Exception as e:
         logger.warning(f"向量搜索失败: {e}")
 
     files = db.query(FileInfo).filter(
-        FileInfo.upload_user == user.id, FileInfo.parse_status == "done"
+        FileInfo.upload_user == user_id, FileInfo.parse_status == "done"
     ).all()
 
     extract_summary = ""
@@ -354,28 +357,22 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
 
     system = _build_system_prompt(files, extract_summary, has_tools=True)
 
-    # ---- 构建消息 ----
     messages = []
     if req.history:
         for h in req.history[-8:]:
             messages.append({"role": h.role, "content": h.content})
 
-    # ---- 收集所有选中的文件 ID（兼容单选 file_id 和多选 file_ids）----
-    all_file_ids = []
-    if req.file_ids:
-        all_file_ids = list(req.file_ids)
-    elif req.file_id:
-        all_file_ids = [req.file_id]
+    all_file_ids = list(req.file_ids) if req.file_ids else ([req.file_id] if req.file_id else [])
 
     target_file_hint = ""
     image_paths = []
     if all_file_ids:
         doc_hints = []
         for fid in all_file_ids:
-            fi = db.query(FileInfo).filter(FileInfo.id == fid, FileInfo.upload_user == user.id).first()
+            fi = db.query(FileInfo).filter(FileInfo.id == fid, FileInfo.upload_user == user_id).first()
             if not fi:
                 continue
-            if fi.file_type in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+            if fi.file_type in _IMAGE_EXTS:
                 image_paths.append(fi.file_path)
             else:
                 doc_hints.append(f"ID={fi.id}, 文件名={fi.file_name}, 类型={fi.file_type}")
@@ -391,7 +388,6 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
     if target_file_hint:
         user_msg += target_file_hint
 
-    # 如果有图片，构建多模态消息（替换 history 中最后一条 user 消息）
     if image_paths:
         from services.llm_service import build_image_content_blocks
         multimodal_content = build_image_content_blocks(image_paths, user_msg)
@@ -408,6 +404,106 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
             messages.append({"role": "user", "content": user_msg})
         else:
             messages[-1]["content"] = user_msg
+
+    return messages, system
+
+
+def _build_action_summary(tool_actions) -> str:
+    """把工具调用列表渲染成中文处理步骤摘要，用于落库。"""
+    action_lines = []
+    for a in tool_actions:
+        label = _TOOL_LABELS.get(a["tool"], a["tool"])
+        inp = a.get("input") or {}
+        detail = ""
+        if a["tool"] == "format_document":
+            parts = []
+            if inp.get("style_target"):
+                st_map = {"heading": "标题", "heading_1": "一级标题", "heading_2": "二级标题",
+                          "heading_3": "三级标题", "body": "正文", "all": "全文"}
+                parts.append(f"筛选: {st_map.get(inp['style_target'], inp['style_target'])}")
+            if inp.get("font_name"):
+                parts.append(f"字体: {inp['font_name']}")
+            if inp.get("font_size"):
+                parts.append(f"字号: {inp['font_size']}磅")
+            if inp.get("bold") is not None:
+                parts.append("加粗" if inp["bold"] else "取消加粗")
+            if inp.get("alignment"):
+                al_map = {"center": "居中", "left": "左对齐", "right": "右对齐", "justify": "两端对齐"}
+                parts.append(al_map.get(inp["alignment"], inp["alignment"]))
+            if inp.get("color"):
+                color_map = {"FF0000": "红色", "0000FF": "蓝色", "000000": "黑色", "008000": "绿色"}
+                c = str(inp["color"]).lstrip("#").upper()
+                parts.append(f"颜色: {color_map.get(c, '#' + c)}")
+            if parts:
+                detail = "（" + "、".join(parts) + "）"
+        elif a["tool"] == "edit_document":
+            ops = inp.get("operations", [])
+            detail = f"（{len(ops)}项修改）" if ops else ""
+        elif a["tool"] == "search_documents":
+            q = inp.get("query", "")
+            detail = f"（关键词：{q}）" if q else ""
+        action_lines.append(f"- {label}{detail}")
+    return "\n".join(action_lines)
+
+
+def _collect_edited_files(db: Session, tool_actions):
+    """从工具调用记录中反查被改写/新建的文件，供前端展示下载入口。"""
+    edited_files = []
+    seen_fids = set()
+    for a in tool_actions:
+        if a["tool"] not in ("edit_document", "format_document", "create_spreadsheet",
+                             "format_spreadsheet", "add_chart", "validate_spreadsheet",
+                             "fill_template_smart"):
+            continue
+        fid = (a.get("input") or {}).get("file_id")
+        if not fid and a["tool"] in ("create_spreadsheet", "fill_template_smart"):
+            try:
+                fid = json.loads(a.get("result", "{}")).get("file_id")
+            except Exception:
+                pass
+        if fid and fid not in seen_fids:
+            seen_fids.add(fid)
+            fi = db.query(FileInfo).filter(FileInfo.id == fid).first()
+            if fi:
+                edited_files.append({"id": fi.id, "name": fi.file_name, "type": fi.file_type})
+    return edited_files
+
+
+async def _run_tool(tool_name: str, tool_input: dict, user_id: int):
+    """执行单个 Agent 工具，异常转为结构化错误字符串。"""
+    logger.info(f"Agent 执行工具: {tool_name}({json.dumps(tool_input, ensure_ascii=False)[:200]})")
+    try:
+        return await execute_tool(tool_name, tool_input, user_id), True
+    except Exception as te:
+        logger.error(f"工具执行异常 {tool_name}: {te}", exc_info=True)
+        return json.dumps({"error": str(te)[:200]}, ensure_ascii=False), False
+
+
+# =====================  非流式接口  =====================
+
+@router.post("/ask")
+async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    query = req.message.strip()
+    if not query:
+        return {"answer": "请输入你的问题。", "session_id": req.session_id}
+
+    # ---- 会话管理 ----
+    chat_sess: Optional[ChatSession] = None
+    if req.session_id is not None:
+        chat_sess = (
+            db.query(ChatSession)
+            .filter(ChatSession.id == req.session_id, ChatSession.user_id == user.id)
+            .first()
+        )
+        if not chat_sess:
+            raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    else:
+        chat_sess = ChatSession(user_id=user.id, title=_title_from_message(query))
+        db.add(chat_sess)
+        db.commit()
+        db.refresh(chat_sess)
+
+    messages, system = _prepare_turn(db, query, user.id, req)
 
     # ---- Agent 循环 (tool-use) ----
     tool_actions = []
@@ -440,17 +536,9 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
 
             tool_results_content = []
             for tc in tool_calls:
-                t_name = tc["name"]
-                t_input = tc["input"]
-                logger.info(f"Agent 执行工具: {t_name}({json.dumps(t_input, ensure_ascii=False)[:200]})")
-                try:
-                    result_str = await execute_tool(t_name, t_input, user.id)
-                except Exception as te:
-                    logger.error(f"工具执行异常 {t_name}: {te}", exc_info=True)
-                    result_str = json.dumps({"error": str(te)[:200]})
-
+                result_str, _ok = await _run_tool(tc["name"], tc["input"], user.id)
                 tool_actions.append({
-                    "tool": t_name, "input": t_input,
+                    "tool": tc["name"], "input": tc["input"],
                     "result": result_str[:500],
                 })
                 tool_results_content.append({
@@ -473,77 +561,13 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
 
     assistant_content_to_save = final_answer
     if tool_actions:
-        _friendly = {
-            "search_documents": "检索文档内容",
-            "extract_info": "提取关键信息",
-            "list_files": "查询文件列表",
-            "edit_document": "编辑文档内容",
-            "analyze_document": "分析文档结构",
-            "format_document": "调整文档格式",
-            "create_spreadsheet": "创建Excel表格",
-            "format_spreadsheet": "格式化Excel表格",
-            "add_chart": "创建图表",
-            "validate_spreadsheet": "设置数据有效性",
-            "get_extract_results": "获取提取结果",
-            "fill_template_smart": "智能模板填表",
-        }
-        action_lines = []
-        for a in tool_actions:
-            label = _friendly.get(a["tool"], a["tool"])
-            inp = a.get("input", {})
-            detail = ""
-            if a["tool"] == "format_document":
-                parts = []
-                if inp.get("style_target"):
-                    st_map = {"heading": "标题", "heading_1": "一级标题", "heading_2": "二级标题", "heading_3": "三级标题", "body": "正文", "all": "全文"}
-                    parts.append(f"筛选: {st_map.get(inp['style_target'], inp['style_target'])}")
-                if inp.get("font_name"):
-                    parts.append(f"字体: {inp['font_name']}")
-                if inp.get("font_size"):
-                    parts.append(f"字号: {inp['font_size']}磅")
-                if inp.get("bold") is not None:
-                    parts.append("加粗" if inp["bold"] else "取消加粗")
-                if inp.get("alignment"):
-                    al_map = {"center": "居中", "left": "左对齐", "right": "右对齐", "justify": "两端对齐"}
-                    parts.append(al_map.get(inp["alignment"], inp["alignment"]))
-                if inp.get("color"):
-                    color_map = {"FF0000": "红色", "0000FF": "蓝色", "000000": "黑色", "008000": "绿色"}
-                    c = inp["color"].lstrip("#").upper()
-                    parts.append(f"颜色: {color_map.get(c, '#' + c)}")
-                if parts:
-                    detail = "（" + "、".join(parts) + "）"
-            elif a["tool"] == "analyze_document":
-                detail = ""
-            elif a["tool"] == "edit_document":
-                ops = inp.get("operations", [])
-                detail = f"（{len(ops)}项修改）" if ops else ""
-            elif a["tool"] == "search_documents":
-                q = inp.get("query", "")
-                detail = f"（关键词：{q}）" if q else ""
-            action_lines.append(f"- {label}{detail}")
-        action_summary = "\n".join(action_lines)
-        assistant_content_to_save = f"{final_answer}\n\n---\n**已完成的处理：**\n{action_summary}"
+        assistant_content_to_save = f"{final_answer}\n\n---\n**已完成的处理：**\n{_build_action_summary(tool_actions)}"
 
     db.add(ChatMessage(session_id=chat_sess.id, role="assistant", content=assistant_content_to_save))
     chat_sess.updated_at = datetime.now()
     db.commit()
 
-    edited_files = []
-    seen_fids = set()
-    for a in tool_actions:
-        if a["tool"] in ("edit_document", "format_document", "create_spreadsheet", "format_spreadsheet", "add_chart", "validate_spreadsheet", "fill_template_smart"):
-            fid = a.get("input", {}).get("file_id")
-            if not fid and a["tool"] in ("create_spreadsheet", "fill_template_smart"):
-                try:
-                    res = json.loads(a.get("result", "{}"))
-                    fid = res.get("file_id")
-                except Exception:
-                    pass
-            if fid and fid not in seen_fids:
-                seen_fids.add(fid)
-                fi = db.query(FileInfo).filter(FileInfo.id == fid).first()
-                if fi:
-                    edited_files.append({"id": fi.id, "name": fi.file_name, "type": fi.file_type})
+    edited_files = _collect_edited_files(db, tool_actions)
 
     return {
         "answer": final_answer,
@@ -551,3 +575,152 @@ async def ask(req: ChatReq, db: Session = Depends(get_db), user: User = Depends(
         "tool_actions": tool_actions if tool_actions else None,
         "edited_files": edited_files if edited_files else None,
     }
+
+
+# =====================  流式接口（SSE）  =====================
+
+def _sse(obj: dict) -> str:
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+async def _ask_stream_gen(req: ChatReq, user_id: int):
+    """SSE 事件流：session → delta* / tool_start+tool_end* → done（或 error）。
+
+    数据库连接按阶段短开短关：流式响应会长时间持有请求，若沿用请求级 Session
+    容易在客户端断开时留下未释放的连接。
+    """
+    query = req.message.strip()
+    if not query:
+        yield _sse({"type": "error", "message": "请输入你的问题。"})
+        return
+
+    # ---- 会话与上下文准备 ----
+    db = SessionLocal()
+    try:
+        if req.session_id is not None:
+            chat_sess = (
+                db.query(ChatSession)
+                .filter(ChatSession.id == req.session_id, ChatSession.user_id == user_id)
+                .first()
+            )
+            if not chat_sess:
+                yield _sse({"type": "error", "message": "会话不存在或无权访问"})
+                return
+        else:
+            chat_sess = ChatSession(user_id=user_id, title=_title_from_message(query))
+            db.add(chat_sess)
+            db.commit()
+            db.refresh(chat_sess)
+        session_id = chat_sess.id
+        messages, system = _prepare_turn(db, query, user_id, req)
+    except Exception as e:
+        logger.error(f"会话准备失败: {e}", exc_info=True)
+        yield _sse({"type": "error", "message": f"会话准备失败：{str(e)[:200]}"})
+        return
+    finally:
+        db.close()
+
+    yield _sse({"type": "session", "session_id": session_id})
+
+    tool_actions = []
+    streamed_text = ""
+    completed = False
+
+    try:
+        for _round in range(MAX_TOOL_ROUNDS):
+            round_text = ""
+            tool_calls = []
+
+            async for ev in call_llm_stream(
+                messages, system=system, temperature=0.3,
+                max_tokens=3000, tools=AGENT_TOOLS,
+            ):
+                if ev["type"] == "text":
+                    round_text += ev["text"]
+                    streamed_text += ev["text"]
+                    yield _sse({"type": "delta", "text": ev["text"]})
+                elif ev["type"] == "done":
+                    tool_calls = ev.get("tool_calls") or []
+                    stop_reason = ev.get("stop_reason") or ""
+
+            if not tool_calls or stop_reason != "tool_use":
+                completed = True
+                break
+
+            assistant_content = []
+            if round_text:
+                assistant_content.append({"type": "text", "text": round_text})
+            for tc in tool_calls:
+                assistant_content.append({
+                    "type": "tool_use", "id": tc["id"],
+                    "name": tc["name"], "input": tc["input"],
+                })
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_results_content = []
+            for tc in tool_calls:
+                yield _sse({"type": "tool_start", "tool": tc["name"], "input": tc["input"]})
+                result_str, ok = await _run_tool(tc["name"], tc["input"], user_id)
+                tool_actions.append({
+                    "tool": tc["name"], "input": tc["input"],
+                    "result": result_str[:500],
+                })
+                yield _sse({"type": "tool_end", "tool": tc["name"], "ok": ok})
+                tool_results_content.append({
+                    "type": "tool_result", "tool_use_id": tc["id"],
+                    "content": result_str[:4000],
+                })
+            messages.append({"role": "user", "content": tool_results_content})
+    except Exception as e:
+        logger.error(f"流式 Agent 循环异常: {e}", exc_info=True)
+        yield _sse({"type": "error", "message": f"处理请求时出现错误：{str(e)[:200]}"})
+        return
+
+    if not completed and not streamed_text:
+        streamed_text = "操作已完成（达到最大轮次）。"
+        yield _sse({"type": "delta", "text": streamed_text})
+    if not streamed_text:
+        streamed_text = "操作已完成。"
+        yield _sse({"type": "delta", "text": streamed_text})
+
+    # ---- 落库 ----
+    edited_files = []
+    db2 = SessionLocal()
+    try:
+        db2.add(ChatMessage(session_id=session_id, role="user", content=query))
+        content_to_save = streamed_text
+        if tool_actions:
+            content_to_save = f"{streamed_text}\n\n---\n**已完成的处理：**\n{_build_action_summary(tool_actions)}"
+        db2.add(ChatMessage(session_id=session_id, role="assistant", content=content_to_save))
+        sess = db2.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if sess:
+            sess.updated_at = datetime.now()
+        db2.commit()
+        edited_files = _collect_edited_files(db2, tool_actions)
+    except Exception as e:
+        logger.error(f"对话落库失败: {e}", exc_info=True)
+        db2.rollback()
+    finally:
+        db2.close()
+
+    yield _sse({
+        "type": "done",
+        "session_id": session_id,
+        "answer": streamed_text,
+        "tool_actions": tool_actions or None,
+        "edited_files": edited_files or None,
+    })
+
+
+@router.post("/ask/stream")
+async def ask_stream(req: ChatReq, user: User = Depends(get_current_user)):
+    """流式对话接口。返回 text/event-stream，逐 token 推送模型输出与工具执行状态。"""
+    return StreamingResponse(
+        _ask_stream_gen(req, user.id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -78,6 +78,54 @@ export const chatApi = {
     else if (fileId != null) body.file_id = fileId
     return api.post('/api/chat/ask', body)
   },
+  /**
+   * 流式对话。用 fetch + ReadableStream 读取 SSE（EventSource 不支持 POST + 自定义头）。
+   * @param {object} body 请求体，字段同 ask
+   * @param {{ onEvent?: (ev: object) => void, signal?: AbortSignal }} opts
+   */
+  askStream: async (body, { onEvent, signal } = {}) => {
+    const token = sessionStorage.getItem('token')
+    const resp = await fetch('/api/chat/ask/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+      signal,
+    })
+    if (resp.status === 401) {
+      sessionStorage.removeItem('token')
+      sessionStorage.removeItem('user')
+      window.location.href = '/login'
+      throw new Error('未登录')
+    }
+    if (!resp.ok || !resp.body) throw new Error(`请求失败（HTTP ${resp.status}）`)
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buf = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let sep
+      while ((sep = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, sep)
+        buf = buf.slice(sep + 2)
+        for (const line of raw.split('\n')) {
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (!payload) continue
+          try {
+            onEvent?.(JSON.parse(payload))
+          } catch {
+            /* 忽略无法解析的心跳或半包 */
+          }
+        }
+      }
+    }
+  },
 }
 
 export const dashApi = {

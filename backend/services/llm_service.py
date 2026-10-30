@@ -38,6 +38,310 @@ async def call_llm_text(messages: List[Dict], system: str = "", temperature: flo
     return r["text"]
 
 
+# =====================  流式调用（SSE）  =====================
+
+class _ThinkFilter:
+    """过滤 <think>...</think> 思维链。
+
+    部分模型（MiniMax 等）会在正文里夹带思维链。流式场景下标签可能被切分到
+    多个 delta 中，因此需要保留可能是半个标签的尾巴，等下一段拼上再判断。
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def feed(self, delta: str) -> str:
+        if not delta:
+            return ""
+        self._buf += delta
+        out: List[str] = []
+        while True:
+            if self._in_think:
+                idx = self._buf.find(self._CLOSE)
+                if idx < 0:
+                    # 思维链异常长且没有闭合标签时，丢弃并复位，避免无限累积
+                    if len(self._buf) > 4000:
+                        self._buf = ""
+                        self._in_think = False
+                    break
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._in_think = False
+            else:
+                idx = self._buf.find(self._OPEN)
+                if idx < 0:
+                    keep = 0
+                    for k in range(1, len(self._OPEN)):
+                        if self._buf.endswith(self._OPEN[:k]):
+                            keep = k
+                    if keep:
+                        out.append(self._buf[:-keep])
+                        self._buf = self._buf[-keep:]
+                    else:
+                        out.append(self._buf)
+                        self._buf = ""
+                    break
+                out.append(self._buf[:idx])
+                self._buf = self._buf[idx + len(self._OPEN):]
+                self._in_think = True
+        return "".join(out)
+
+    def flush(self) -> str:
+        if self._in_think:
+            self._buf = ""
+            return ""
+        rest, self._buf = self._buf, ""
+        return rest
+
+
+def _iter_sse_payloads(line: str) -> Optional[str]:
+    """从一行 SSE 文本中取出 data 字段；非数据行返回 None。"""
+    if not line or not line.startswith("data:"):
+        return None
+    payload = line[5:].strip()
+    return payload or None
+
+
+async def call_llm_stream(
+    messages: List[Dict[str, Any]],
+    system: str = "",
+    temperature: float = 0.1,
+    max_tokens: int = 4096,
+    tools: Optional[List[Dict]] = None,
+):
+    """流式调用大模型。
+
+    逐个 yield 事件字典：
+      {"type": "text", "text": "增量文本"}
+      {"type": "done", "text": "完整文本", "tool_calls": [...], "stop_reason": "..."}
+
+    仅在尚未产出任何文本前允许重试，避免重复输出已推送的内容。
+    """
+    impl = _stream_anthropic if cfg.LLM_API_FORMAT == "anthropic" else _stream_openai
+    emitted = False
+    last_err: Optional[Exception] = None
+
+    for attempt in range(3):
+        try:
+            async for ev in impl(messages, system, temperature, max_tokens, tools):
+                if ev["type"] == "text":
+                    emitted = True
+                yield ev
+            return
+        except Exception as e:
+            last_err = e
+            if emitted or attempt == 2:
+                raise
+            import asyncio
+            await asyncio.sleep(2 * (attempt + 1))
+    if last_err:
+        raise last_err
+
+
+async def _stream_anthropic(messages, system, temperature, max_tokens, tools):
+    url = f"{cfg.LLM_API_BASE.rstrip('/')}/v1/messages"
+    headers = {"Content-Type": "application/json", "x-api-key": cfg.LLM_API_KEY, "anthropic-version": ANTHROPIC_VERSION}
+    clean = _fix_messages(messages)
+    body: Dict[str, Any] = {"model": cfg.LLM_MODEL, "max_tokens": max_tokens, "messages": clean, "stream": True}
+    if system:
+        body["system"] = system
+    if temperature is not None:
+        body["temperature"] = temperature
+    if tools:
+        body["tools"] = tools
+    if cfg.LLM_DISABLE_THINKING:
+        body["thinking"] = {"type": "disabled"}
+
+    think = _ThinkFilter()
+    text_parts: List[str] = []
+    blocks: Dict[int, Dict[str, Any]] = {}
+    stop_reason = ""
+
+    c = _get_shared_client()
+    async with c.stream("POST", url, json=body, headers=headers) as resp:
+        if resp.status_code >= 400:
+            detail = (await resp.aread()).decode("utf-8", "ignore")[:500]
+            raise RuntimeError(f"LLM 流式请求失败 {resp.status_code}: {detail}")
+        async for line in resp.aiter_lines():
+            payload = _iter_sse_payloads(line)
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except Exception:
+                continue
+            et = ev.get("type")
+            if et == "content_block_start":
+                idx = ev.get("index", 0)
+                blk = ev.get("content_block") or {}
+                if blk.get("type") == "tool_use":
+                    blocks[idx] = {"id": blk.get("id", ""), "name": blk.get("name", ""), "json": ""}
+            elif et == "content_block_delta":
+                idx = ev.get("index", 0)
+                delta = ev.get("delta") or {}
+                dt = delta.get("type")
+                if dt == "text_delta":
+                    out = think.feed(delta.get("text", ""))
+                    if out:
+                        text_parts.append(out)
+                        yield {"type": "text", "text": out}
+                elif dt == "input_json_delta" and idx in blocks:
+                    blocks[idx]["json"] += delta.get("partial_json", "")
+            elif et == "message_delta":
+                stop_reason = (ev.get("delta") or {}).get("stop_reason") or stop_reason
+            elif et == "error":
+                raise RuntimeError(f"LLM 流式返回错误: {json.dumps(ev.get('error', ev), ensure_ascii=False)[:300]}")
+            elif et == "message_stop":
+                break
+
+    tail = think.flush()
+    if tail:
+        text_parts.append(tail)
+        yield {"type": "text", "text": tail}
+
+    tool_calls = []
+    for idx in sorted(blocks):
+        b = blocks[idx]
+        try:
+            inp = json.loads(b["json"]) if b["json"].strip() else {}
+        except Exception:
+            inp = {}
+        tool_calls.append({"id": b["id"], "name": b["name"], "input": inp})
+
+    yield {
+        "type": "done",
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "stop_reason": "tool_use" if tool_calls else (stop_reason or "end_turn"),
+    }
+
+
+async def _stream_openai(messages, system, temperature, max_tokens, tools=None):
+    url = f"{cfg.LLM_API_BASE.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if cfg.LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {cfg.LLM_API_KEY}"
+
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    for m in messages:
+        content = m.get("content", "")
+        role = m.get("role", "user")
+        if isinstance(content, list):
+            if role == "assistant":
+                text_parts_ = [b["text"] for b in content if b.get("type") == "text"]
+                oai_tool_calls = [
+                    {
+                        "id": b["id"], "type": "function",
+                        "function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)},
+                    }
+                    for b in content if b.get("type") == "tool_use"
+                ]
+                msg = {"role": "assistant", "content": "\n".join(text_parts_) or None}
+                if oai_tool_calls:
+                    msg["tool_calls"] = oai_tool_calls
+                msgs.append(msg)
+            else:
+                oai_parts, has_tool_result = [], False
+                for b in content:
+                    if b.get("type") == "tool_result":
+                        has_tool_result = True
+                        msgs.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": b.get("content", "")})
+                    elif b.get("type") == "image":
+                        src = b.get("source", {})
+                        oai_parts.append({"type": "image_url", "image_url": {"url": f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"}})
+                    elif b.get("type") == "text":
+                        oai_parts.append({"type": "text", "text": b["text"]})
+                if oai_parts:
+                    msgs.append({"role": "user", "content": oai_parts})
+        else:
+            msgs.append({"role": role, "content": content})
+
+    body: Dict[str, Any] = {
+        "model": cfg.LLM_MODEL, "messages": msgs, "temperature": temperature,
+        "max_tokens": max_tokens, "stream": True,
+    }
+    if tools:
+        body["tools"] = [
+            {"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}}
+            for t in tools
+        ]
+    if cfg.LLM_DISABLE_THINKING:
+        body["thinking"] = {"type": "disabled"}
+
+    think = _ThinkFilter()
+    text_parts: List[str] = []
+    tool_buf: Dict[int, Dict[str, str]] = {}
+    stop_reason = ""
+
+    c = _get_shared_client()
+    async with c.stream("POST", url, json=body, headers=headers) as resp:
+        if resp.status_code >= 400:
+            detail = (await resp.aread()).decode("utf-8", "ignore")[:500]
+            raise RuntimeError(f"LLM 流式请求失败 {resp.status_code}: {detail}")
+        async for line in resp.aiter_lines():
+            payload = _iter_sse_payloads(line)
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+
+            content = delta.get("content")
+            if content:
+                out = think.feed(content)
+                if out:
+                    text_parts.append(out)
+                    yield {"type": "text", "text": out}
+
+            for tc in (delta.get("tool_calls") or []):
+                idx = tc.get("index", 0)
+                slot = tool_buf.setdefault(idx, {"id": "", "name": "", "args": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name") and not slot["name"]:
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+
+            fr = choice.get("finish_reason")
+            if fr:
+                stop_reason = "tool_use" if fr == "tool_calls" else fr
+
+    tail = think.flush()
+    if tail:
+        text_parts.append(tail)
+        yield {"type": "text", "text": tail}
+
+    tool_calls = []
+    for idx in sorted(tool_buf):
+        slot = tool_buf[idx]
+        try:
+            inp = json.loads(slot["args"]) if slot["args"].strip() else {}
+        except Exception:
+            inp = {}
+        tool_calls.append({"id": slot["id"], "name": slot["name"], "input": inp})
+
+    yield {
+        "type": "done",
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "stop_reason": "tool_use" if tool_calls else (stop_reason or "end_turn"),
+    }
+
+
+
 async def _call_anthropic(messages, system, temperature, max_tokens, tools):
     import logging
     _logger = logging.getLogger("llm_service")
