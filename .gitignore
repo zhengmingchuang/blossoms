@@ -1,0 +1,35 @@
+# 环境配置
+backend/.env
+
+# 数据库
+backend/app.db
+
+# 上传文件
+backend/uploads/
+backend/exports/
+
+# 向量存储
+backend/vector_store/chunks.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 项目内 LibreOffice（体积大，由 scripts/install_libreoffice.ps1 生成）
+vendor/LibreOffice/
+
+# 调试产物
+_tpl_headers.json
+
+# 本地 AI 工作区数据
+.workbuddy-ai/
