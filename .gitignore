@@ -33,3 +33,6 @@ _tpl_headers.json
 
 # 本地 AI 工作区数据
 .workbuddy-ai/
+
+# 数据库备份
+backend/*.db.bak*
