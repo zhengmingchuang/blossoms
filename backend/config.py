@@ -13,9 +13,9 @@ EXPORT_DIR.mkdir(exist_ok=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'app.db'}")
 
-LLM_API_BASE = os.getenv("LLM_API_BASE", "http://hangzhou.cstext.top:54352")
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.deepseek.com/anthropic")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
 LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "anthropic")
 
 # 关闭模型思考模式（DeepSeek V4 默认开启，会带来三个问题）：

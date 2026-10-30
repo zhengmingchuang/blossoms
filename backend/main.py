@@ -75,12 +75,14 @@ except Exception as _init_err:
 
 def load_saved_config():
     db = SessionLocal()
+    overridden = []
     try:
         mapping = {"llm_api_base": "LLM_API_BASE", "llm_api_key": "LLM_API_KEY", "llm_model": "LLM_MODEL", "llm_api_format": "LLM_API_FORMAT", "embedding_model": "EMBEDDING_MODEL"}
         for db_key, cfg_attr in mapping.items():
             row = db.query(SystemConfig).filter(SystemConfig.config_key == db_key).first()
             if row and row.config_value:
                 setattr(cfg, cfg_attr, row.config_value)
+                overridden.append(db_key)
         mcp_row = db.query(SystemConfig).filter(SystemConfig.config_key == "mcp_enabled").first()
         if mcp_row:
             cfg.MCP_ENABLED = mcp_row.config_value.lower() == "true"
@@ -88,6 +90,15 @@ def load_saved_config():
         pass
     finally:
         db.close()
+    # 数据库配置会静默覆盖 .env，容易让人误以为改 .env 就生效了，这里把实际生效值打出来
+    logging.getLogger("main").info(
+        "LLM 生效配置: format=%s base=%s model=%s key=%s 来源=%s",
+        cfg.LLM_API_FORMAT,
+        cfg.LLM_API_BASE,
+        cfg.LLM_MODEL,
+        "已设置" if cfg.LLM_API_KEY else "缺失",
+        ("数据库覆盖 " + ",".join(overridden)) if overridden else ".env",
+    )
     try:
         import jieba
         jieba.initialize()
