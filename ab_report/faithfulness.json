@@ -1,0 +1,21 @@
+{
+  "case": "city100",
+  "deepseek": {
+    "total": 400,
+    "missing": 0,
+    "faithfulness": 1.0,
+    "suspects": []
+  },
+  "baseline": {
+    "total": 400,
+    "missing": 1,
+    "faithfulness": 0.9975,
+    "suspects": [
+      {
+        "entity": "苏州",
+        "col": "GDP总量（亿元）",
+        "val": "27027.1"
+      }
+    ]
+  }
+}

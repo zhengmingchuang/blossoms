@@ -1,0 +1,50 @@
+[
+  {
+    "case": "city100",
+    "desc": "2025 中国城市经济百强（100 行 × 5 列；源为叙事型 docx，最考验段落内数值抽取）",
+    "columns": [
+      "城市名",
+      "GDP总量（亿元）",
+      "常住人口（万）",
+      "人均GDP（元）",
+      "一般公共预算收入（亿元）"
+    ],
+    "source_chars": 11315,
+    "batches": 5,
+    "baseline_rows": 100,
+    "smoke": false,
+    "claude": null,
+    "deepseek": {
+      "baseline_rows": 100,
+      "pred_rows_raw": 100,
+      "pred_rows_dedup": 100,
+      "duplicate_rows": 0,
+      "matched": 100,
+      "missing": 0,
+      "extra": 0,
+      "coverage": 1.0,
+      "cell_total": 400,
+      "cell_ok": 399,
+      "cell_accuracy": 0.9975,
+      "colname_compliance": 1.0,
+      "missing_sample": [],
+      "extra_sample": [],
+      "cell_mismatch_sample": [
+        {
+          "entity": "苏州",
+          "col": "GDP总量（亿元）",
+          "pred": "27695.1",
+          "base": "27027.1"
+        }
+      ],
+      "wall_sec": 5.7,
+      "sum_batch_sec": 21.38,
+      "in_tokens": 8432,
+      "out_tokens": 6690,
+      "truncated_repairs": 0,
+      "batch_errors": [],
+      "model": "deepseek-flash"
+    },
+    "delta": null
+  }
+]
