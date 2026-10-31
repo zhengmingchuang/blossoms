@@ -11,6 +11,22 @@ DocFusion 面向「**多源文档 → 结构化指标 → 模板填报**」这�
 
 ---
 
+## 〇、团队信息
+
+| 项 | 内容 |
+|---|---|
+| 团队名称 | Blossoms pave your way |
+| 参赛者 | 郑铭创、叶子豪、刘沛嫣 |
+| 学校 | 广州软件学院 |
+| 组别 | B 组（非 985/211 普通本科院校本科生） |
+| 指导教师 | 喻晓雨、翟玲玲 |
+| 参赛赛事 | 2026 第九届传智杯 · 全国高校 AI Web 开发挑战赛 |
+| 赛题方向 | 方向 4：AI 协同办公工具 —— 智能文档分析平台 |
+
+分工：郑铭创（后端架构、抽取与填表链路）、叶子豪（前端交互与可视化）、刘沛嫣（数据处理、测试与文档）。
+
+---
+
 ## 一、核心能力
 
 | 模块 | 能力 | 实现位置 |
@@ -21,7 +37,7 @@ DocFusion 面向「**多源文档 → 结构化指标 → 模板填报**」这�
 | 模板识别 | 自动判定 `table_fill`（表头批量填）/ `field_fill`（字段填空），支持 docx 多表 | `services/template_filler.py` |
 | 表格填报 | 列名语义映射、脏数据清洗、伪合计行剔除、行政区后缀归一化、求和/极值/均值列 | `routers/templates.py`、`services/smart_fill.py` |
 | 图片填充 | Excel 图片占位符：WPS `DISPIMG` 单元格图片 + openpyxl 浮动图片 | `services/image_filler.py` |
-| 文档编辑 | 10 个 Agent 工具（改文档 / 排版 / 建表 / 加图表 / 校验表格），自然语言驱动 | `services/doc_editor.py` |
+| 文档编辑 | 12 个 Agent 工具（改文档 / 排版 / 建表 / 加图表 / 校验表格 / 智能填表），自然语言驱动 | `services/doc_editor.py` |
 | 智能对话 | SSE 流式输出、工具调用步骤实时回显、可中断 | `routers/chat.py` |
 | MCP 服务 | 13 个工具经 MCP 协议对外暴露（HTTP + SSE / JSON-RPC） | `services/mcp_service.py` |
 | 开放接口 | `/api/openapi/*` 供外部系统调用抽取能力 | `routers/openapi.py` |
