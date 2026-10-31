@@ -1597,6 +1597,12 @@ async def _fill_table_mode(t, tpl_info, db, user, source_file_ids=None):
         logger.info(f"[table_fill] 统计配置: max={stats_config.get('max')}, min={stats_config.get('min')}, avg={stats_config.get('avg')}")
 
     # 8. 填充并保存
+    # 行数统计以最终写入的行数据为准：上面经历了过滤 / 补行 / 伪合计清理 / 排序 / 去重，
+    # 早先赋值的 total_rows 会失真（曾导致实际写入 3 行却回显「0行数据」）。
+    if isinstance(rows_data, dict):
+        total_rows = sum(len(v) for v in rows_data.values())
+    else:
+        total_rows = len(rows_data or [])
     out_name = _make_export_filename(t.template_name, EXPORT_DIR)
     out_path = str(EXPORT_DIR / out_name)
     logger.info(f"[table_fill] 开始填充模板: {out_name}")
