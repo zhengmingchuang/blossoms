@@ -263,7 +263,7 @@ def main() -> int:
         if p.exists() and not args.force:
             skipped.append(p.name)
             continue
-        p.write_text(content, encoding="utf-8")
+        p.write_text(content, encoding="utf-8", newline="\n")
         print(f"  ✓ {p.relative_to(ROOT)}")
 
     if skipped:
