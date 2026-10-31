@@ -69,9 +69,9 @@
             <h3 class="sec-title">LLM 配置</h3>
             <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
               <span style="font-size:13px;color:var(--text-secondary);line-height:28px;">快捷预设：</span>
-              <el-button size="small" @click="applyPreset('minimax-api')">MiniMax (API Key)</el-button>
-              <el-button size="small" @click="applyPreset('minimax-token')">MiniMax (Token Plan)</el-button>
-              <el-button size="small" @click="applyPreset('anthropic')">Anthropic 中转</el-button>
+              <el-button size="small" type="primary" @click="applyPreset('deepseek')">DeepSeek（推荐）</el-button>
+              <el-button size="small" @click="applyPreset('openai-compat')">OpenAI 兼容</el-button>
+              <el-button size="small" @click="applyPreset('custom')">自定义</el-button>
             </div>
             <el-form :model="form" label-width="110px" label-position="left">
               <el-form-item label="API 地址"><el-input v-model="form.llm_api_base" placeholder="http://..." /></el-form-item>
@@ -79,7 +79,7 @@
                 <el-input v-model="form.llm_api_key" :placeholder="hasKey ? '已配置（留空不修改）' : 'sk-...'" type="text" autocomplete="off" />
                 <div v-if="hasKey" class="field-hint">留空则保持原有 Key 不变</div>
               </el-form-item>
-              <el-form-item label="模型"><el-input v-model="form.llm_model" placeholder="claude-sonnet-4-6" /></el-form-item>
+              <el-form-item label="模型"><el-input v-model="form.llm_model" placeholder="deepseek-flash" /></el-form-item>
               <el-form-item label="API 格式">
                 <el-radio-group v-model="form.llm_api_format">
                   <el-radio value="anthropic">Anthropic</el-radio>
@@ -264,10 +264,11 @@ const saveConfig = async () => {
   } catch { ElMessage.error('保存失败') } finally { saving.value = false }
 }
 const applyPreset = (name) => {
+  // 只保留当前实测可用的预设；失效的第三方中转端点已移除，避免填入后请求 404。
   const presets = {
-    'minimax-token': { llm_api_base: 'https://api.minimaxi.com/anthropic', llm_model: 'MiniMax-M2.5', llm_api_format: 'anthropic' },
-    'minimax-api': { llm_api_base: 'https://api.minimaxi.com/anthropic', llm_model: 'MiniMax-M2.7-highspeed', llm_api_format: 'anthropic' },
-    'anthropic': { llm_api_base: 'https://key.simpleai.com.cn', llm_model: 'claude-sonnet-4-6', llm_api_format: 'anthropic' },
+    'deepseek': { llm_api_base: 'https://api.deepseek.com/anthropic', llm_model: 'deepseek-flash', llm_api_format: 'anthropic' },
+    'openai-compat': { llm_api_base: 'https://api.deepseek.com', llm_model: 'deepseek-chat', llm_api_format: 'openai' },
+    'custom': { llm_api_base: '', llm_model: '', llm_api_format: 'openai' },
   }
   const p = presets[name]
   if (p) {
@@ -275,7 +276,7 @@ const applyPreset = (name) => {
     form.value.llm_model = p.llm_model
     form.value.llm_api_format = p.llm_api_format
     form.value.llm_api_key = ''
-    ElMessage.info('已填入预设，请填写 API Key 后点击保存')
+    ElMessage.info(name === 'custom' ? '请填写自建/第三方兼容端点后保存' : '已填入预设，请填写 API Key 后点击保存')
   }
 }
 const loadUsers = async () => { try { users.value = (await settingsApi.users()).data.users } catch {} }
