@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" font-family="Microsoft YaHei, PingFang SC, Helvetica, Arial, sans-serif">
+  <rect width="960" height="600" fill="#ffffff"/>
+
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a8f98"/>
+    </marker>
+  </defs>
+
+  <!-- 层标签 -->
+  <text x="40" y="34" font-size="13" fill="#9aa0a6">分层架构</text>
+
+  <!-- 前端 -->
+  <rect x="150" y="46" width="660" height="72" rx="10" fill="#eef4ff" stroke="#a9c2f0" stroke-width="1.4"/>
+  <text x="172" y="74" font-size="16" font-weight="700" fill="#1f3b6e">前端层 · Vue 3 单页应用</text>
+  <text x="172" y="99" font-size="13" fill="#42556e">文档管理 · 信息抽取 · 模板填报 · 智能交互 · 系统设置（Element Plus + ECharts）</text>
+
+  <line x1="480" y1="118" x2="480" y2="150" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 路由层 -->
+  <rect x="150" y="152" width="660" height="72" rx="10" fill="#f1f6f1" stroke="#b3cfb6" stroke-width="1.4"/>
+  <text x="172" y="180" font-size="16" font-weight="700" fill="#2c4a30">接入层 · FastAPI 路由（11 个模块）</text>
+  <text x="172" y="205" font-size="13" fill="#425a46">HTTP REST · SSE 流式 · JWT 鉴权 · OpenAPI(/api/open) · MCP(/api/mcp)</text>
+
+  <line x1="480" y1="224" x2="480" y2="256" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 业务 + 检索 -->
+  <rect x="150" y="258" width="400" height="72" rx="10" fill="#fdf5ec" stroke="#e2c39a" stroke-width="1.4"/>
+  <text x="170" y="286" font-size="16" font-weight="700" fill="#6b4517">业务服务层</text>
+  <text x="170" y="311" font-size="13" fill="#6b5a44">解析 · 抽取 · 数据筛选 · 模板填表 · 文档编辑</text>
+
+  <rect x="572" y="258" width="238" height="72" rx="10" fill="#fdf5ec" stroke="#e2c39a" stroke-width="1.4"/>
+  <text x="592" y="286" font-size="16" font-weight="700" fill="#6b4517">检索层</text>
+  <text x="592" y="311" font-size="13" fill="#6b5a44">向量检索 / TF-IDF 降级</text>
+
+  <line x1="350" y1="330" x2="350" y2="362" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+  <line x1="691" y1="330" x2="691" y2="362" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 模型适配层 -->
+  <rect x="150" y="364" width="660" height="72" rx="10" fill="#f7f0fa" stroke="#cbb0da" stroke-width="1.4"/>
+  <text x="172" y="392" font-size="16" font-weight="700" fill="#4b2a5e">模型适配层</text>
+  <text x="172" y="417" font-size="13" fill="#5b4a66">Anthropic / OpenAI 双协议 · 流式 tool_use 分片拼接 · 思维链过滤 · 超时重试</text>
+
+  <line x1="350" y1="436" x2="350" y2="468" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+  <line x1="691" y1="436" x2="691" y2="468" stroke="#8a8f98" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 数据 + 外部 -->
+  <rect x="150" y="470" width="400" height="72" rx="10" fill="#f2f2f4" stroke="#c6c8cc" stroke-width="1.4"/>
+  <text x="170" y="498" font-size="16" font-weight="700" fill="#33383d">数据层</text>
+  <text x="170" y="523" font-size="13" fill="#4c5257">SQLite（users / file_info / doc_chunk / extracted_field / template_mapping）</text>
+
+  <rect x="572" y="470" width="238" height="72" rx="10" fill="#f2f2f4" stroke="#c6c8cc" stroke-width="1.4"/>
+  <text x="592" y="498" font-size="16" font-weight="700" fill="#33383d">外部模型服务</text>
+  <text x="592" y="523" font-size="13" fill="#4c5257">LLM API（DeepSeek 等）</text>
+
+  <!-- 文件存储 -->
+  <rect x="150" y="556" width="660" height="30" rx="8" fill="#fafafa" stroke="#dcdcdc" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="170" y="576" font-size="13" fill="#5c6166">文件存储：uploads /（源文档）　exports /（填报产出）</text>
+</svg>
