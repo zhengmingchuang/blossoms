@@ -1,7 +1,10 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 from database import engine, Base, SessionLocal
 from models import SystemConfig
@@ -132,6 +135,33 @@ app.include_router(openapi.router)
 @app.get("/api/health")
 def health():
     return {"status": "ok", "system": "DocFusion 1.0"}
+
+
+# ===================== 生产模式：后端直接托管前端产物 =====================
+# 开发时用 `npm run dev`（3000 端口，Vite 把 /api 代理到本服务）。
+# 演示/部署时先 `npm run build`，这里会把 frontend/dist 挂上来，
+# 于是单端口（默认 8000）即可访问完整应用，不需要额外的 Nginx。
+_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+if (_DIST_DIR / "index.html").exists():
+    if (_DIST_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=_DIST_DIR / "assets"), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        """静态资源命中则返回文件，其余路径回落到 index.html（兼容 history 路由）。"""
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        if full_path:
+            candidate = (_DIST_DIR / full_path).resolve()
+            # 限制在 dist 目录内，防止 ../ 路径穿越
+            if candidate.is_file() and _DIST_DIR.resolve() in candidate.parents:
+                return FileResponse(candidate)
+        return FileResponse(_DIST_DIR / "index.html")
+
+    logging.getLogger("main").info("已启用前端静态托管: %s（访问 http://127.0.0.1:8000/）", _DIST_DIR)
+else:
+    logging.getLogger("main").info("未找到 frontend/dist，仅提供 API（开发模式请另起 npm run dev）")
 
 
 if __name__ == "__main__":

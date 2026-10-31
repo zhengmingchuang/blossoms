@@ -3,6 +3,7 @@ backend/.env
 
 # 数据库
 backend/app.db
+backend/_verify.db
 
 # 上传文件
 backend/uploads/
