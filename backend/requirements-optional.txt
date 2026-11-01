@@ -1,0 +1,9 @@
+# 可选依赖：语义检索（向量召回）
+#
+# 安装后 services/vector_store.py 会使用 SentenceTransformer 生成嵌入向量，
+# 检索质量优于 TF-IDF 降级方案；不装则自动降级，主流程不受影响。
+#
+# 注意：会连带安装 PyTorch，磁盘占用约 2 GB，首次运行还需下载嵌入模型。
+# 安装：pip install -r requirements-optional.txt
+
+sentence-transformers==3.1.1

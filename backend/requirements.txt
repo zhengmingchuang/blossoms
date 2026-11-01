@@ -10,6 +10,11 @@ PyJWT==2.9.0
 pydantic==2.9.2
 jieba==0.42.1
 numpy==1.26.4
-sentence-transformers==3.1.1
 python-dotenv==1.0.1
 bcrypt==4.2.0
+
+# 可选：语义检索用（会连带安装 PyTorch，约 2 GB）。
+# 不装也能跑通全部主流程 —— services/vector_store.py 会捕获 ImportError
+# 并自动降级为 TF-IDF 检索。需要最佳召回效果时再装：
+#   pip install -r requirements-optional.txt
+# sentence-transformers==3.1.1

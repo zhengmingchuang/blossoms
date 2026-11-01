@@ -138,8 +138,9 @@ python main.py            # 默认 http://127.0.0.1:8000
 
 首次启动会自动建表、创建管理员 **admin / admin123**（请自行修改）。
 
-> `sentence-transformers` 会拉取 PyTorch，体积较大且首次要下载嵌入模型。
-> 如果只想先跑通主流程，可以跳过它——检索会自动降级为 TF-IDF，其余功能不受影响。
+> `requirements.txt` **默认不含** `sentence-transformers`（它会连带安装 PyTorch，约 2 GB）。
+> 不装也能跑通全部主流程——`services/vector_store.py` 捕获 ImportError 后自动降级为 TF-IDF 检索。
+> 需要更好的召回效果时再单独安装：`pip install -r requirements-optional.txt`。
 
 ### 2. 前端（开发模式）
 
