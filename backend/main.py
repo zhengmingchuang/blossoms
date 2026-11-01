@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -166,4 +167,6 @@ else:
 
 if __name__ == "__main__":
     _ensure_app_loggers_to_stderr()
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    # 云托管（如 Sites / 容器）通过 PORT 注入端口，本地默认 8000
+    _port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=False)

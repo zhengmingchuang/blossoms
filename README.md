@@ -158,6 +158,12 @@ cd ../backend && python main.py  # 直接访问 http://127.0.0.1:8000
 后端检测到 `frontend/dist/index.html` 会自动托管静态资源，并对非 `/api` 路径回落 `index.html`
 （兼容前端 history 路由），因此**不需要额外配 Nginx**，一个端口就能演示完整应用。
 
+端口默认 8000，云托管时读取环境变量 `PORT`（绑定 `0.0.0.0`）：
+
+```bash
+PORT=8080 python main.py    # 容器 / 云平台注入 PORT 时无需改代码
+```
+
 ---
 
 ## 五、模型配置（最容易踩的坑）
