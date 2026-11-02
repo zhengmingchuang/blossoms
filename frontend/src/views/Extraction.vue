@@ -1,6 +1,9 @@
 <template>
   <div>
-    <div class="page-header"><h2>信息提取</h2><p>查看文档提取结果、来源证据与多源融合数据</p></div>
+    <div class="page-header">
+      <h2>信息提取</h2>
+      <p>查看文档提取结果、来源证据与多源融合数据</p>
+    </div>
 
     <div class="card card-animate">
       <el-tabs v-model="tab">
@@ -11,7 +14,7 @@
               <el-icon><Document /></el-icon>
               <span class="file-block-name">{{ f.file_name }}</span>
               <el-tag size="small" type="info">{{ f.field_count }} 个字段</el-tag>
-              <el-icon style="margin-left:auto;"><ArrowDown v-if="!f._open" /><ArrowUp v-else /></el-icon>
+              <el-icon style="margin-left: auto"><ArrowDown v-if="!f._open" /><ArrowUp v-else /></el-icon>
             </div>
             <div v-if="f._open" class="file-block-body">
               <div v-if="f._loading" class="loading-hint">加载中...</div>
@@ -19,41 +22,71 @@
                 <div v-for="fd in getPagedFields(f)" :key="fd.field_name" class="field-row">
                   <span class="field-label">{{ fd.field_name }}</span>
                   <span class="field-value">{{ fd.field_value }}</span>
-                  <span :class="['conf-badge', fd.confidence >= 0.8 ? 'high' : 'mid']">{{ (fd.confidence * 100).toFixed(0) }}%</span>
+                  <span :class="['conf-badge', fd.confidence >= 0.8 ? 'high' : 'mid']"
+                    >{{ (fd.confidence * 100).toFixed(0) }}%</span
+                  >
                 </div>
-                <el-pagination v-if="f._fields.length > 10"
-                  style="margin-top:8px;justify-content:flex-end;"
+                <el-pagination
+                  v-if="f._fields.length > 10"
+                  style="margin-top: 8px; justify-content: flex-end"
                   layout="total, prev, pager, next"
-                  :total="f._fields.length" :page-size="10"
+                  :total="f._fields.length"
+                  :page-size="10"
                   :current-page="filePages[String(f.file_id)] || 1"
+                  size="small"
                   @current-change="p => setFilePage(f.file_id, p)"
-                  size="small" />
+                />
               </template>
               <div v-else class="loading-hint">暂无提取字段</div>
             </div>
           </div>
           <el-empty v-if="!fileList.length" description="暂无提取结果" :image-size="60" />
-          <el-pagination v-if="fileList.length > 10"
-            style="margin-top:12px;justify-content:flex-end;"
-            layout="total, prev, pager, next"
-            :total="fileList.length" :page-size="10"
+          <el-pagination
+            v-if="fileList.length > 10"
             v-model:current-page="fileListPage"
-            size="small" />
+            style="margin-top: 12px; justify-content: flex-end"
+            layout="total, prev, pager, next"
+            :total="fileList.length"
+            :page-size="10"
+            size="small"
+          />
         </el-tab-pane>
 
         <!-- 提取结果 -->
         <el-tab-pane label="提取结果" name="raw">
           <div class="filter-bar">
-            <el-select v-model="filterFileId" placeholder="按文件筛选" clearable size="small" style="width:200px;" @change="loadRaw">
+            <el-select
+              v-model="filterFileId"
+              placeholder="按文件筛选"
+              clearable
+              size="small"
+              style="width: 200px"
+              @change="loadRaw"
+            >
               <el-option v-for="f in fileList" :key="f.file_id" :label="f.file_name" :value="f.file_id" />
             </el-select>
-            <el-input v-model="filterField" placeholder="按字段名搜索" clearable style="width:180px;" size="small" @clear="loadRaw" @keyup.enter="loadRaw" />
+            <el-input
+              v-model="filterField"
+              placeholder="按字段名搜索"
+              clearable
+              style="width: 180px"
+              size="small"
+              @clear="loadRaw"
+              @keyup.enter="loadRaw"
+            />
             <el-button size="small" type="primary" @click="loadRaw">搜索</el-button>
-            <el-button v-if="rawSelection.length" type="danger" size="small" @click="batchDeleteRaw">批量删除 ({{ rawSelection.length }})</el-button>
+            <el-button v-if="rawSelection.length" type="danger" size="small" @click="batchDeleteRaw"
+              >批量删除 ({{ rawSelection.length }})</el-button
+            >
             <span class="total-hint">共 {{ rawTotal }} 条</span>
           </div>
 
-          <el-table :data="rawResults" v-loading="loadingRaw" size="small" @selection-change="rows => rawSelection = rows">
+          <el-table
+            v-loading="loadingRaw"
+            :data="rawResults"
+            size="small"
+            @selection-change="rows => (rawSelection = rows)"
+          >
             <el-table-column type="selection" width="40" />
             <el-table-column prop="file_name" label="来源文件" width="160" show-overflow-tooltip />
             <el-table-column prop="field_name" label="字段名" width="120" show-overflow-tooltip />
@@ -65,7 +98,12 @@
             </el-table-column>
             <el-table-column prop="confidence" label="置信度" width="75">
               <template #default="{ row }">
-                <span :class="['conf-badge', row.confidence >= 0.8 ? 'high' : row.confidence >= 0.5 ? 'mid' : 'low']">
+                <span
+                  :class="[
+                    'conf-badge',
+                    row.confidence >= 0.8 ? 'high' : row.confidence >= 0.5 ? 'mid' : 'low',
+                  ]"
+                >
                   {{ (row.confidence * 100).toFixed(0) }}%
                 </span>
               </template>
@@ -74,7 +112,9 @@
             <el-table-column prop="source_position" label="来源位置" width="100" show-overflow-tooltip />
             <el-table-column label="操作" width="100">
               <template #default="{ row }">
-                <el-button v-if="editId !== row.id" link type="primary" size="small" @click="startEdit(row)">修正</el-button>
+                <el-button v-if="editId !== row.id" link type="primary" size="small" @click="startEdit(row)"
+                  >修正</el-button
+                >
                 <template v-else>
                   <el-button link type="success" size="small" @click="saveEdit(row)">保存</el-button>
                   <el-button link size="small" @click="editId = null">取消</el-button>
@@ -85,11 +125,13 @@
 
           <el-pagination
             v-if="rawTotal > rawPageSize"
-            style="margin-top:16px;justify-content:flex-end;"
+            v-model:current-page="rawPage"
+            style="margin-top: 16px; justify-content: flex-end"
             layout="total, prev, pager, next"
-            :total="rawTotal" :page-size="rawPageSize"
-            v-model:current-page="rawPage" @current-change="loadRaw"
+            :total="rawTotal"
+            :page-size="rawPageSize"
             size="small"
+            @current-change="loadRaw"
           />
         </el-tab-pane>
 
@@ -98,12 +140,14 @@
           <div class="fused-meta">
             来自 {{ fusedMeta.source_files || 0 }} 个文件，融合得到 {{ fusedResults.length }} 个字段
           </div>
-          <el-table :data="fusedPagedResults" v-loading="loadingFused" size="small">
+          <el-table v-loading="loadingFused" :data="fusedPagedResults" size="small">
             <el-table-column prop="field_name" label="字段名" width="130" />
             <el-table-column prop="field_value" label="融合值" show-overflow-tooltip min-width="200" />
             <el-table-column prop="confidence" label="置信度" width="75">
               <template #default="{ row }">
-                <span :class="['conf-badge', row.confidence >= 0.8 ? 'high' : 'mid']">{{ (row.confidence * 100).toFixed(0) }}%</span>
+                <span :class="['conf-badge', row.confidence >= 0.8 ? 'high' : 'mid']"
+                  >{{ (row.confidence * 100).toFixed(0) }}%</span
+                >
               </template>
             </el-table-column>
             <el-table-column prop="source_file" label="最佳来源" width="150" show-overflow-tooltip />
@@ -112,20 +156,34 @@
               <template #default="{ row }">
                 <el-popover trigger="click" width="320">
                   <template #reference><el-button link size="small">查看</el-button></template>
-                  <div style="font-size:13px;font-weight:600;margin-bottom:8px;">{{ row.field_name }} 的所有候选值</div>
-                  <div v-for="(c, i) in row.all_candidates" :key="i" style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.3);">
-                    <div><b>{{ c.value }}</b></div>
-                    <div style="font-size:12px;color:var(--text-secondary);">来源: {{ c.file }} | 权重: {{ c.weight }}</div>
+                  <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px">
+                    {{ row.field_name }} 的所有候选值
+                  </div>
+                  <div
+                    v-for="(c, i) in row.all_candidates"
+                    :key="i"
+                    style="padding: 5px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.3)"
+                  >
+                    <div>
+                      <b>{{ c.value }}</b>
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-secondary)">
+                      来源: {{ c.file }} | 权重: {{ c.weight }}
+                    </div>
                   </div>
                 </el-popover>
               </template>
             </el-table-column>
           </el-table>
-          <el-pagination v-if="fusedResults.length > 15"
-            style="margin-top:12px;justify-content:flex-end;"
+          <el-pagination
+            v-if="fusedResults.length > 15"
+            v-model:current-page="fusedPage"
+            style="margin-top: 12px; justify-content: flex-end"
             layout="total, prev, pager, next"
-            :total="fusedResults.length" :page-size="15"
-            v-model:current-page="fusedPage" size="small" />
+            :total="fusedResults.length"
+            :page-size="15"
+            size="small"
+          />
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -133,7 +191,7 @@
 </template>
 
 <script setup>
-import { ref, computed, reactive, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { extractApi } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -155,9 +213,9 @@ const pagedFileList = computed(() => {
   const start = (fileListPage.value - 1) * 10
   return fileList.value.slice(start, start + 10)
 })
-const filePages = ref({})   // file_id -> current page
+const filePages = ref({}) // file_id -> current page
 
-const getPagedFields = (f) => {
+const getPagedFields = f => {
   if (!f._fields) return []
   const page = filePages.value[String(f.file_id)] || 1
   const start = (page - 1) * 10
@@ -181,8 +239,12 @@ const loadRaw = async () => {
     if (filterField.value) params.field_name = filterField.value
     if (filterFileId.value) params.file_id = filterFileId.value
     const { data } = await extractApi.results(params)
-    rawResults.value = data.results; rawTotal.value = data.total
-  } catch {} finally { loadingRaw.value = false }
+    rawResults.value = data.results
+    rawTotal.value = data.total
+  } catch {
+  } finally {
+    loadingRaw.value = false
+  }
 }
 
 const loadFiles = async () => {
@@ -192,7 +254,7 @@ const loadFiles = async () => {
   } catch {}
 }
 
-const toggleFile = async (f) => {
+const toggleFile = async f => {
   const idx = fileList.value.indexOf(f)
   if (idx === -1) return
   // 用 Object.assign 触发响应式更新
@@ -212,32 +274,56 @@ const loadFused = async () => {
   loadingFused.value = true
   try {
     const { data } = await extractApi.fused()
-    fusedResults.value = data.fused_results; fusedMeta.value = { source_files: data.source_files }
-  } catch {} finally { loadingFused.value = false }
+    fusedResults.value = data.fused_results
+    fusedMeta.value = { source_files: data.source_files }
+  } catch {
+  } finally {
+    loadingFused.value = false
+  }
 }
 
 const batchDeleteRaw = async () => {
   const count = rawSelection.value.length
-  try { await ElMessageBox.confirm(`确定删除选中的 ${count} 条提取结果？`, '批量删除', { type: 'warning' }) } catch { return }
+  try {
+    await ElMessageBox.confirm(`确定删除选中的 ${count} 条提取结果？`, '批量删除', { type: 'warning' })
+  } catch {
+    return
+  }
   try {
     await extractApi.batchDelete(rawSelection.value.map(r => r.id))
     ElMessage.success(`已删除 ${count} 条记录`)
     rawSelection.value = []
     loadRaw()
-  } catch { ElMessage.error('删除失败') }
+  } catch {
+    ElMessage.error('删除失败')
+  }
 }
 
-const startEdit = row => { editId.value = row.id; editVal.value = row.field_value }
+const startEdit = row => {
+  editId.value = row.id
+  editVal.value = row.field_value
+}
 const saveEdit = async row => {
   try {
     await extractApi.update(row.id, editVal.value)
-    row.field_value = editVal.value; row.confidence = 1; row.extract_method = 'manual'
-    editId.value = null; ElMessage.success('已更新')
-  } catch { ElMessage.error('更新失败') }
+    row.field_value = editVal.value
+    row.confidence = 1
+    row.extract_method = 'manual'
+    editId.value = null
+    ElMessage.success('已更新')
+  } catch {
+    ElMessage.error('更新失败')
+  }
 }
 
-watch(tab, v => { if (v === 'fused') loadFused(); if (v === 'byfile' && !fileList.value.length) loadFiles() })
-onMounted(() => { loadRaw(); loadFiles() })
+watch(tab, v => {
+  if (v === 'fused') loadFused()
+  if (v === 'byfile' && !fileList.value.length) loadFiles()
+})
+onMounted(() => {
+  loadRaw()
+  loadFiles()
+})
 </script>
 
 <style scoped>
@@ -248,7 +334,11 @@ onMounted(() => { loadRaw(); loadFiles() })
   margin-bottom: 14px;
   flex-wrap: wrap;
 }
-.total-hint { margin-left: auto; font-size: 13px; color: var(--text-secondary); }
+.total-hint {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
 
 .conf-badge {
   font-size: 12px;
@@ -256,14 +346,27 @@ onMounted(() => { loadRaw(); loadFiles() })
   padding: 2px 6px;
   border-radius: 6px;
 }
-.conf-badge.high { color: #3a9e7a; background: rgba(103,197,164,0.15); }
-.conf-badge.mid { color: #b08a20; background: rgba(232,184,73,0.15); }
-.conf-badge.low { color: #c05050; background: rgba(224,112,112,0.15); }
+.conf-badge.high {
+  color: #3a9e7a;
+  background: rgba(103, 197, 164, 0.15);
+}
+.conf-badge.mid {
+  color: #b08a20;
+  background: rgba(232, 184, 73, 0.15);
+}
+.conf-badge.low {
+  color: #c05050;
+  background: rgba(224, 112, 112, 0.15);
+}
 
-.fused-meta { font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; }
+.fused-meta {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
 
 .file-block {
-  border: 1px solid rgba(255,255,255,0.4);
+  border: 1px solid rgba(255, 255, 255, 0.4);
   border-radius: 12px;
   margin-bottom: 10px;
   overflow: hidden;
@@ -275,33 +378,59 @@ onMounted(() => { loadRaw(); loadFiles() })
   gap: 10px;
   padding: 12px 16px;
   cursor: pointer;
-  background: rgba(255,255,255,0.2);
+  background: rgba(255, 255, 255, 0.2);
   font-size: 14px;
   font-weight: 500;
   color: var(--text-color);
   transition: background 0.2s;
 }
-.file-block-header:hover { background: rgba(255,255,255,0.4); }
-.file-block-name { flex: 1; }
-.file-block-body { padding: 8px 16px; }
+.file-block-header:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+.file-block-name {
+  flex: 1;
+}
+.file-block-body {
+  padding: 8px 16px;
+}
 
 .field-row {
   display: flex;
   align-items: center;
   padding: 7px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.2);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
   font-size: 13px;
   color: var(--text-color);
 }
-.field-label { width: 120px; color: var(--text-secondary); flex-shrink: 0; }
-.field-value { flex: 1; }
+.field-label {
+  width: 120px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.field-value {
+  flex: 1;
+}
 
-.loading-hint { padding: 16px; color: var(--text-secondary); font-size: 13px; text-align: center; }
+.loading-hint {
+  padding: 16px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+}
 
 @media (max-width: 767px) {
-  .field-label { width: 80px; font-size: 12px; }
-  .field-value { font-size: 12px; }
-  .filter-bar { gap: 6px; }
-  .total-hint { margin-left: 0; }
+  .field-label {
+    width: 80px;
+    font-size: 12px;
+  }
+  .field-value {
+    font-size: 12px;
+  }
+  .filter-bar {
+    gap: 6px;
+  }
+  .total-hint {
+    margin-left: 0;
+  }
 }
 </style>

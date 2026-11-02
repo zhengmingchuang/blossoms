@@ -14,7 +14,7 @@
           <span class="sidebar-title">历史对话</span>
           <el-button type="primary" size="small" plain @click="newChat">新对话</el-button>
         </div>
-        <div class="session-list" v-loading="sessionsLoading">
+        <div v-loading="sessionsLoading" class="session-list">
           <div
             v-for="s in sessions"
             :key="s.id"
@@ -25,29 +25,31 @@
               <div class="session-title">{{ s.title }}</div>
               <div class="session-meta">{{ s.updated_at }}</div>
             </div>
-            <el-button
-              class="session-del"
-              type="danger"
-              link
-              :icon="Delete"
-              @click.stop="removeSession(s)"
-            />
+            <el-button class="session-del" type="danger" link :icon="Delete" @click.stop="removeSession(s)" />
           </div>
           <div v-if="!sessions.length && !sessionsLoading" class="session-empty">暂无历史记录</div>
         </div>
         <div v-if="editedDocHistory.length" class="edited-docs-section">
           <div class="edited-docs-head">
             <span class="edited-docs-title">📦 文档修改记录</span>
-            <el-button type="danger" size="small" link @click="clearDocHistory" style="font-size:11px">清空</el-button>
+            <el-button type="danger" size="small" link style="font-size: 11px" @click="clearDocHistory"
+              >清空</el-button
+            >
           </div>
           <div class="edited-docs-list">
-            <div v-for="(doc, idx) in editedDocHistory" :key="doc.id + '-' + doc.time + '-' + idx" class="edited-doc-item">
+            <div
+              v-for="(doc, idx) in editedDocHistory"
+              :key="doc.id + '-' + doc.time + '-' + idx"
+              class="edited-doc-item"
+            >
               <div class="edited-doc-info">
                 <span class="edited-doc-name" :title="doc.name">📄 {{ doc.name }}</span>
                 <span class="edited-doc-time">{{ doc.time }}</span>
               </div>
               <div class="edited-doc-actions">
-                <el-button type="primary" size="small" link :icon="Download" @click="downloadFile(doc)">下载</el-button>
+                <el-button type="primary" size="small" link :icon="Download" @click="downloadFile(doc)"
+                  >下载</el-button
+                >
                 <el-button type="danger" size="small" link :icon="Delete" @click="removeDocHistory(idx)" />
               </div>
             </div>
@@ -56,7 +58,7 @@
       </aside>
 
       <div class="chat-main card card-animate">
-        <div class="messages" ref="msgBox">
+        <div ref="msgBox" class="messages">
           <div v-if="!messages.length" class="welcome">
             <div class="welcome-icon">
               <div class="welcome-icon-inner">💡</div>
@@ -64,16 +66,26 @@
             <h3>你好，有什么可以帮你？</h3>
             <p>我可以帮你查询文档内容、提取信息、填写模板、执行分析任务</p>
             <div class="cmd-groups">
-              <div class="cmd-group" v-for="g in cmdGroups" :key="g.title">
+              <div v-for="g in cmdGroups" :key="g.title" class="cmd-group">
                 <div class="cmd-group-title">{{ g.icon }} {{ g.title }}</div>
-                <div class="qq" v-for="c in g.cmds" :key="c" @click="input = c; send()">{{ c }}</div>
+                <div v-for="c in g.cmds" :key="c" class="qq" @click="pickCmd(c)">
+                  {{ c }}
+                </div>
               </div>
             </div>
           </div>
 
-          <div v-for="(m, i) in messages" :key="i + '-' + (m.create_time || '') + m.role" :class="['msg', m.role]">
+          <div
+            v-for="(m, i) in messages"
+            :key="i + '-' + (m.create_time || '') + m.role"
+            :class="['msg', m.role]"
+          >
             <div class="msg-avatar">
-              <img :src="m.role === 'user' ? userAvatar : '/cs-avatar.jpg'" class="msg-avatar-img" @error="e => e.target.style.display='none'" />
+              <img
+                :src="m.role === 'user' ? userAvatar : '/cs-avatar.jpg'"
+                class="msg-avatar-img"
+                @error="e => (e.target.style.display = 'none')"
+              />
               <span class="msg-avatar-fallback">{{ m.role === 'user' ? userInitial : 'AI' }}</span>
             </div>
             <div class="msg-content">
@@ -81,18 +93,21 @@
                 <div class="tool-actions-title">📋 处理步骤</div>
                 <div v-for="(ta, ti) in m.toolActions" :key="ti" class="tool-action-item">
                   <span class="tool-action-name">{{ toolLabel(ta.tool) }}</span>
-                  <span class="tool-action-detail" v-if="ta.input">{{ toolInputSummary(ta) }}</span>
+                  <span v-if="ta.input" class="tool-action-detail">{{ toolInputSummary(ta) }}</span>
                   <span v-if="ta.pending" class="tool-action-state">执行中…</span>
                   <span v-else-if="ta.ok === false" class="tool-action-state is-fail">失败</span>
                 </div>
-                <div class="tool-actions-done" v-if="!m.streaming">处理完成</div>
+                <div v-if="!m.streaming" class="tool-actions-done">处理完成</div>
               </div>
               <div class="msg-bubble" :class="{ 'is-streaming': m.streaming }">
                 <template v-if="m.role === 'assistant'">
                   <div v-if="m.streaming && !m.content" class="typing">
                     <span></span><span></span><span></span>
                   </div>
-                  <div v-else v-html="renderMd(m.content)" class="md-body"></div>
+                  <!-- 内容由 marked 渲染模型输出的 Markdown。信任边界在服务端（只回显已授权文档），
+                       此处不再二次转义，否则表格与代码块无法正常显示。 -->
+                  <!-- eslint-disable-next-line vue/no-v-html -->
+                  <div v-else class="md-body" v-html="renderMd(m.content)"></div>
                 </template>
                 <div v-else>{{ m.content }}</div>
               </div>
@@ -106,7 +121,6 @@
               </div>
             </div>
           </div>
-
         </div>
 
         <div class="input-area">
@@ -125,18 +139,29 @@
             >
               <el-option-group label="已上传文档/图片">
                 <el-option v-for="f in uploadFiles" :key="f.id" :label="f.name" :value="f.id">
-                  <span style="font-size:13px">{{ f.name }}</span>
-                  <el-tag size="small" :type="f.source === 'image' ? 'warning' : 'info'" style="margin-left:6px">.{{ f.type }}</el-tag>
+                  <span style="font-size: 13px">{{ f.name }}</span>
+                  <el-tag
+                    size="small"
+                    :type="f.source === 'image' ? 'warning' : 'info'"
+                    style="margin-left: 6px"
+                    >.{{ f.type }}</el-tag
+                  >
                 </el-option>
               </el-option-group>
               <el-option-group v-if="filledFiles.length" label="已填写的文档">
                 <el-option v-for="f in filledFiles" :key="f.id" :label="f.name" :value="f.id">
-                  <span style="font-size:13px">{{ f.name }}</span>
-                  <el-tag size="small" type="success" style="margin-left:6px">.{{ f.type }}</el-tag>
+                  <span style="font-size: 13px">{{ f.name }}</span>
+                  <el-tag size="small" type="success" style="margin-left: 6px">.{{ f.type }}</el-tag>
                 </el-option>
               </el-option-group>
             </el-select>
-            <el-upload :http-request="chatUpload" :show-file-list="false" accept=".docx,.doc,.md,.xlsx,.xls,.txt,.png,.jpg,.jpeg,.gif,.webp,.bmp" multiple class="chat-upload-btn">
+            <el-upload
+              :http-request="chatUpload"
+              :show-file-list="false"
+              accept=".docx,.doc,.md,.xlsx,.xls,.txt,.png,.jpg,.jpeg,.gif,.webp,.bmp"
+              multiple
+              class="chat-upload-btn"
+            >
               <el-button size="small" :icon="UploadFilled" :loading="uploading">上传文档/图片</el-button>
             </el-upload>
           </div>
@@ -144,13 +169,13 @@
             <el-input
               v-model="input"
               placeholder="输入你的问题或指令..."
-              @keyup.enter="send"
               class="chat-input"
+              @keyup.enter="send"
             />
-            <el-button v-if="!sending" type="primary" :icon="Promotion" @click="send" class="send-btn">
+            <el-button v-if="!sending" type="primary" :icon="Promotion" class="send-btn" @click="send">
               发送
             </el-button>
-            <el-button v-else type="danger" :icon="VideoPause" @click="stop" class="send-btn">
+            <el-button v-else type="danger" :icon="VideoPause" class="send-btn" @click="stop">
               停止
             </el-button>
           </div>
@@ -158,11 +183,17 @@
       </div>
     </div>
 
-    <el-drawer v-model="historyDrawerOpen" title="历史对话" direction="ltr" size="300px" class="chat-history-drawer">
+    <el-drawer
+      v-model="historyDrawerOpen"
+      title="历史对话"
+      direction="ltr"
+      size="300px"
+      class="chat-history-drawer"
+    >
       <div class="drawer-actions">
         <el-button type="primary" size="small" @click="newChat">新对话</el-button>
       </div>
-      <div class="session-list drawer-sessions" v-loading="sessionsLoading">
+      <div v-loading="sessionsLoading" class="session-list drawer-sessions">
         <div
           v-for="s in sessions"
           :key="'d-' + s.id"
@@ -173,13 +204,7 @@
             <div class="session-title">{{ s.title }}</div>
             <div class="session-meta">{{ s.updated_at }}</div>
           </div>
-          <el-button
-            class="session-del"
-            type="danger"
-            link
-            :icon="Delete"
-            @click.stop="removeSession(s)"
-          />
+          <el-button class="session-del" type="danger" link :icon="Delete" @click.stop="removeSession(s)" />
         </div>
         <div v-if="!sessions.length && !sessionsLoading" class="session-empty">暂无历史记录</div>
       </div>
@@ -205,8 +230,10 @@ const userAvatar = computed(() => {
 const userInitial = computed(() => {
   try {
     const u = JSON.parse(sessionStorage.getItem('user') || '{}')
-    return ((u.nickname || u.username || 'U')[0]).toUpperCase()
-  } catch { return 'U' }
+    return (u.nickname || u.username || 'U')[0].toUpperCase()
+  } catch {
+    return 'U'
+  }
 })
 
 const messages = ref([])
@@ -227,14 +254,14 @@ const _saveDocHistory = () => {
   localStorage.setItem('editedDocHistory', JSON.stringify(keep))
 }
 
-const addToDocHistory = (ef) => {
+const addToDocHistory = ef => {
   const now = new Date()
-  const timeStr = `${now.getMonth()+1}/${now.getDate()} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`
+  const timeStr = `${now.getMonth() + 1}/${now.getDate()} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
   editedDocHistory.value.unshift({ id: ef.id, name: ef.name, type: ef.type, time: timeStr })
   _saveDocHistory()
 }
 
-const removeDocHistory = (idx) => {
+const removeDocHistory = idx => {
   editedDocHistory.value.splice(idx, 1)
   _saveDocHistory()
 }
@@ -242,7 +269,9 @@ const removeDocHistory = (idx) => {
 const clearDocHistory = async () => {
   try {
     await ElMessageBox.confirm('确定清空所有文档修改记录？', '清空记录', { type: 'warning' })
-  } catch { return }
+  } catch {
+    return
+  }
   editedDocHistory.value = []
   localStorage.removeItem('editedDocHistory')
 }
@@ -251,22 +280,38 @@ const uploadFiles = computed(() => fileList.value.filter(f => f.source === 'uplo
 const filledFiles = computed(() => fileList.value.filter(f => f.source === 'filled'))
 
 const cmdGroups = [
-  { icon: '📄', title: '文档查询', cmds: ['上传的文档里有哪些内容？', '帮我查一下GDP相关的数据', '总结一下文档的主要内容'] },
-  { icon: '📊', title: '数据提取', cmds: ['提取文档中的关键指标', '从文件中提取所有人名和日期', '查看已提取的字段结果'] },
-  { icon: '✏️', title: '文档编辑', cmds: ['把文档中的"旧文本"替换为"新文本"', '在文档末尾追加一段说明', '删除文档中包含"废弃"的段落'] },
-  { icon: '🎨', title: '格式调整', cmds: ['把标题设为黑体加粗居中', '全文字号改为12磅宋体', '将正文行距调整为1.5倍'] },
-  { icon: '🧩', title: '智能填表', cmds: ['把数据源按模板格式智能填充', '根据模板生成已填充的表格', '帮我把数据填到模板里，自动算总和与平均值'] },
+  {
+    icon: '📄',
+    title: '文档查询',
+    cmds: ['上传的文档里有哪些内容？', '帮我查一下GDP相关的数据', '总结一下文档的主要内容'],
+  },
+  {
+    icon: '📊',
+    title: '数据提取',
+    cmds: ['提取文档中的关键指标', '从文件中提取所有人名和日期', '查看已提取的字段结果'],
+  },
+  {
+    icon: '✏️',
+    title: '文档编辑',
+    cmds: ['把文档中的"旧文本"替换为"新文本"', '在文档末尾追加一段说明', '删除文档中包含"废弃"的段落'],
+  },
+  {
+    icon: '🎨',
+    title: '格式调整',
+    cmds: ['把标题设为黑体加粗居中', '全文字号改为12磅宋体', '将正文行距调整为1.5倍'],
+  },
+  {
+    icon: '🧩',
+    title: '智能填表',
+    cmds: [
+      '把数据源按模板格式智能填充',
+      '根据模板生成已填充的表格',
+      '帮我把数据填到模板里，自动算总和与平均值',
+    ],
+  },
 ]
 
-const toolSuccess = (ta) => {
-  try {
-    if (!ta.result) return true
-    const r = typeof ta.result === 'string' ? JSON.parse(ta.result) : ta.result
-    return !r.error
-  } catch { return true }
-}
-
-const toolLabel = (name) => {
+const toolLabel = name => {
   const map = {
     search_documents: '检索文档内容',
     extract_info: '提取关键信息',
@@ -284,12 +329,12 @@ const toolLabel = (name) => {
   return map[name] || '处理中'
 }
 
-const _findFileName = (fileId) => {
+const _findFileName = fileId => {
   const f = fileList.value.find(x => x.id === fileId)
   return f ? f.name : ''
 }
 
-const toolInputSummary = (ta) => {
+const toolInputSummary = ta => {
   try {
     const inp = ta.input || {}
     const fname = inp.file_id ? _findFileName(inp.file_id) : ''
@@ -304,7 +349,14 @@ const toolInputSummary = (ta) => {
     if (ta.tool === 'format_document') {
       const parts = []
       if (inp.style_target) {
-        const stMap = { heading: '标题', heading_1: '一级标题', heading_2: '二级标题', heading_3: '三级标题', body: '正文', all: '全文' }
+        const stMap = {
+          heading: '标题',
+          heading_1: '一级标题',
+          heading_2: '二级标题',
+          heading_3: '三级标题',
+          body: '正文',
+          all: '全文',
+        }
         parts.push(stMap[inp.style_target] || inp.style_target)
       }
       if (inp.font_name) parts.push(inp.font_name)
@@ -328,17 +380,30 @@ const toolInputSummary = (ta) => {
       return parts.join(' + ')
     }
     return ''
-  } catch { return '' }
+  } catch {
+    return ''
+  }
 }
 
-const renderMd = t => { try { return marked.parse(t || '') } catch { return t } }
-const scrollBottom = () => nextTick(() => { if (msgBox.value) msgBox.value.scrollTop = msgBox.value.scrollHeight })
+const renderMd = t => {
+  try {
+    return marked.parse(t || '')
+  } catch {
+    return t
+  }
+}
+const scrollBottom = () =>
+  nextTick(() => {
+    if (msgBox.value) msgBox.value.scrollTop = msgBox.value.scrollHeight
+  })
 
 const loadFiles = async () => {
   try {
     const { data } = await chatApi.files()
     fileList.value = Array.isArray(data) ? data : []
-  } catch { fileList.value = [] }
+  } catch {
+    fileList.value = []
+  }
 }
 
 const chatUpload = async ({ file }) => {
@@ -356,10 +421,12 @@ const chatUpload = async ({ file }) => {
     }
   } catch {
     ElMessage.error('上传失败')
-  } finally { uploading.value = false }
+  } finally {
+    uploading.value = false
+  }
 }
 
-const downloadFile = async (ef) => {
+const downloadFile = async ef => {
   try {
     const { data } = await chatApi.downloadFile(ef.id)
     const url = URL.createObjectURL(data)
@@ -392,7 +459,7 @@ const newChat = () => {
   historyDrawerOpen.value = false
 }
 
-const openSession = async (id) => {
+const openSession = async id => {
   currentSessionId.value = id
   historyDrawerOpen.value = false
   try {
@@ -405,7 +472,7 @@ const openSession = async (id) => {
   }
 }
 
-const removeSession = async (s) => {
+const removeSession = async s => {
   try {
     await ElMessageBox.confirm(`确定删除「${s.title}」？`, '删除对话', { type: 'warning' })
   } catch {
@@ -425,6 +492,12 @@ let streamCtrl = null
 
 const stop = () => {
   if (streamCtrl) streamCtrl.abort()
+}
+
+/** 点击快捷指令：填入输入框并立即发送 */
+const pickCmd = c => {
+  input.value = c
+  send()
 }
 
 const send = async () => {
@@ -480,10 +553,10 @@ const send = async () => {
               ev.edited_files.forEach(ef => addToDocHistory(ef))
             }
           } else if (ev.type === 'error') {
-            aiMsg.content = aiMsg.content || (ev.message || '处理失败，请稍后重试。')
+            aiMsg.content = aiMsg.content || ev.message || '处理失败，请稍后重试。'
           }
         },
-      }
+      },
     )
     if (!aiMsg.content) aiMsg.content = '操作已完成。'
   } catch (e) {
@@ -494,7 +567,9 @@ const send = async () => {
     }
   } finally {
     aiMsg.streaming = false
-    aiMsg.toolActions.forEach(t => { t.pending = false })
+    aiMsg.toolActions.forEach(t => {
+      t.pending = false
+    })
     sending.value = false
     streamCtrl = null
     scrollBottom()
@@ -502,11 +577,18 @@ const send = async () => {
   }
 }
 
-onMounted(() => { loadSessions(); loadFiles() })
+onMounted(() => {
+  loadSessions()
+  loadFiles()
+})
 </script>
 
 <style scoped>
-.chat-page { height: 100%; display: flex; flex-direction: column; }
+.chat-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
 
 .page-header-row {
   display: flex;
@@ -516,14 +598,24 @@ onMounted(() => { loadSessions(); loadFiles() })
   flex-wrap: wrap;
 }
 
-.history-toggle { flex-shrink: 0; }
+.history-toggle {
+  flex-shrink: 0;
+}
 
-.mobile-only { display: none; }
-.desktop-only { display: flex; }
+.mobile-only {
+  display: none;
+}
+.desktop-only {
+  display: flex;
+}
 
 @media (max-width: 767px) {
-  .mobile-only { display: inline-flex; }
-  .desktop-only { display: none !important; }
+  .mobile-only {
+    display: inline-flex;
+  }
+  .desktop-only {
+    display: none !important;
+  }
 }
 
 .chat-layout {
@@ -565,17 +657,17 @@ onMounted(() => { loadSessions(); loadFiles() })
   padding: 8px;
   min-height: 0;
   scrollbar-width: thin;
-  scrollbar-color: rgba(0,0,0,0.15) transparent;
+  scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
 }
 .session-list::-webkit-scrollbar {
   width: 4px;
 }
 .session-list::-webkit-scrollbar-thumb {
-  background: rgba(0,0,0,0.15);
+  background: rgba(0, 0, 0, 0.15);
   border-radius: 4px;
 }
 .session-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(0,0,0,0.25);
+  background: rgba(0, 0, 0, 0.25);
 }
 
 .session-item {
@@ -622,7 +714,10 @@ onMounted(() => { loadSessions(); loadFiles() })
   margin-top: 4px;
 }
 
-.session-del { flex-shrink: 0; padding: 4px !important; }
+.session-del {
+  flex-shrink: 0;
+  padding: 4px !important;
+}
 
 .session-empty {
   font-size: 13px;
@@ -672,19 +767,33 @@ onMounted(() => { loadSessions(); loadFiles() })
 }
 
 .welcome-icon {
-  width: 72px; height: 72px;
+  width: 72px;
+  height: 72px;
   border-radius: 20px;
   background: var(--card-bg);
   backdrop-filter: var(--card-backdrop);
   border: 1px solid var(--card-border);
-  display: flex; align-items: center; justify-content: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   margin-bottom: 8px;
   box-shadow: var(--card-shadow);
 }
-.welcome-icon-inner { font-size: 32px; }
+.welcome-icon-inner {
+  font-size: 32px;
+}
 
-.welcome h3 { font-size: 20px; font-weight: 700; color: var(--text-color); margin-top: 4px; }
-.welcome p { font-size: 14px; color: var(--text-secondary); max-width: 400px; }
+.welcome h3 {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-color);
+  margin-top: 4px;
+}
+.welcome p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  max-width: 400px;
+}
 
 .cmd-groups {
   display: flex;
@@ -722,7 +831,9 @@ onMounted(() => { loadSessions(); loadFiles() })
   transition: background 0.2s;
   margin-bottom: 4px;
 }
-.qq:hover { background: rgba(255,255,255,0.5); }
+.qq:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
 
 /* 消息气泡 */
 .msg {
@@ -733,27 +844,52 @@ onMounted(() => { loadSessions(); loadFiles() })
 }
 
 @keyframes msg-in {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
-.msg.user { flex-direction: row-reverse; }
+.msg.user {
+  flex-direction: row-reverse;
+}
 
 .msg-avatar {
-  width: 36px; height: 36px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   background: linear-gradient(135deg, var(--palette-1), var(--palette-2));
-  display: flex; align-items: center; justify-content: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
   overflow: hidden;
   position: relative;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
-.msg.assistant .msg-avatar { background: linear-gradient(135deg, var(--palette-3), var(--palette-4)); }
-.msg-avatar-img { width: 100%; height: 100%; object-fit: cover; position: absolute; inset: 0; }
-.msg-avatar-fallback { font-size: 13px; font-weight: 600; color: #fff; }
+.msg.assistant .msg-avatar {
+  background: linear-gradient(135deg, var(--palette-3), var(--palette-4));
+}
+.msg-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  position: absolute;
+  inset: 0;
+}
+.msg-avatar-fallback {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+}
 
-.msg-content { max-width: 70%; }
+.msg-content {
+  max-width: 70%;
+}
 
 .msg-bubble {
   background: var(--card-bg);
@@ -781,38 +917,61 @@ onMounted(() => { loadSessions(); loadFiles() })
   padding: 14px 18px;
 }
 .typing span {
-  width: 7px; height: 7px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--primary-color);
   animation: typing-bounce 1.2s infinite;
 }
-.typing span:nth-child(2) { animation-delay: 0.2s; }
-.typing span:nth-child(3) { animation-delay: 0.4s; }
+.typing span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.typing span:nth-child(3) {
+  animation-delay: 0.4s;
+}
 
 @keyframes typing-bounce {
-  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-  30% { transform: translateY(-6px); opacity: 1; }
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
 }
 
 /* Markdown 样式 */
-.md-body :deep(p) { margin: 0 0 8px; }
-.md-body :deep(p:last-child) { margin-bottom: 0; }
+.md-body :deep(p) {
+  margin: 0 0 8px;
+}
+.md-body :deep(p:last-child) {
+  margin-bottom: 0;
+}
 .md-body :deep(code) {
-  background: rgba(255,255,255,0.4);
+  background: rgba(255, 255, 255, 0.4);
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 13px;
   font-family: 'Fira Code', monospace;
 }
 .md-body :deep(pre) {
-  background: rgba(0,0,0,0.06);
+  background: rgba(0, 0, 0, 0.06);
   padding: 12px;
   border-radius: 8px;
   overflow-x: auto;
   margin: 8px 0;
 }
-.md-body :deep(ul), .md-body :deep(ol) { padding-left: 20px; margin: 4px 0; }
-.md-body :deep(li) { margin-bottom: 4px; }
+.md-body :deep(ul),
+.md-body :deep(ol) {
+  padding-left: 20px;
+  margin: 4px 0;
+}
+.md-body :deep(li) {
+  margin-bottom: 4px;
+}
 
 /* 流式输出光标：挂在最后一段内容尾部，避免整块重排 */
 .msg-bubble.is-streaming .md-body :deep(> :last-child)::after {
@@ -827,8 +986,13 @@ onMounted(() => { loadSessions(); loadFiles() })
   animation: caret-blink 1s steps(2, start) infinite;
 }
 @keyframes caret-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
 }
 
 /* 工具执行状态 */
@@ -844,8 +1008,13 @@ onMounted(() => { loadSessions(); loadFiles() })
   animation: none;
 }
 @keyframes state-pulse {
-  0%, 100% { opacity: 0.45; }
-  50% { opacity: 1; }
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 /* 处理步骤面板 */
@@ -869,7 +1038,7 @@ onMounted(() => { loadSessions(); loadFiles() })
   gap: 8px;
   padding: 5px 0;
   color: var(--text-color);
-  border-bottom: 1px dashed rgba(0,0,0,0.04);
+  border-bottom: 1px dashed rgba(0, 0, 0, 0.04);
 }
 .tool-action-item:last-of-type {
   border-bottom: none;
@@ -967,17 +1136,17 @@ onMounted(() => { loadSessions(); loadFiles() })
   overflow-y: auto;
   padding: 4px 8px 10px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(0,0,0,0.15) transparent;
+  scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
 }
 .edited-docs-list::-webkit-scrollbar {
   width: 4px;
 }
 .edited-docs-list::-webkit-scrollbar-thumb {
-  background: rgba(0,0,0,0.15);
+  background: rgba(0, 0, 0, 0.15);
   border-radius: 4px;
 }
 .edited-docs-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(0,0,0,0.25);
+  background: rgba(0, 0, 0, 0.25);
 }
 .edited-doc-item {
   display: flex;
@@ -1024,8 +1193,8 @@ onMounted(() => { loadSessions(); loadFiles() })
   flex-direction: column;
   gap: 8px;
   padding: 12px 24px 16px;
-  border-top: 1px solid rgba(255,255,255,0.3);
-  background: rgba(255,255,255,0.1);
+  border-top: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.1);
 }
 .input-row {
   display: flex;
@@ -1043,15 +1212,34 @@ onMounted(() => { loadSessions(); loadFiles() })
   flex-shrink: 0;
 }
 
-.chat-input { flex: 1; }
-.send-btn { flex-shrink: 0; height: 40px; padding: 0 20px; }
+.chat-input {
+  flex: 1;
+}
+.send-btn {
+  flex-shrink: 0;
+  height: 40px;
+  padding: 0 20px;
+}
 
 @media (max-width: 767px) {
-  .chat-main { height: calc(100vh - 140px); }
-  .messages { padding: 14px; }
-  .msg-content { max-width: 85%; }
-  .cmd-groups { flex-direction: column; }
-  .cmd-group { min-width: unset; width: 100%; }
-  .input-area { padding: 12px 14px; }
+  .chat-main {
+    height: calc(100vh - 140px);
+  }
+  .messages {
+    padding: 14px;
+  }
+  .msg-content {
+    max-width: 85%;
+  }
+  .cmd-groups {
+    flex-direction: column;
+  }
+  .cmd-group {
+    min-width: unset;
+    width: 100%;
+  }
+  .input-area {
+    padding: 12px 14px;
+  }
 }
 </style>
