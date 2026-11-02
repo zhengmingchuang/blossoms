@@ -6,7 +6,7 @@ DocFusion 面向「**多源文档 → 结构化指标 → 模板填报**」这�
 抽取指标，按列名语义对齐到模板，最后把结果写回**保留原有样式**的 Word / Excel 模板；全程可用自然语言驱动。
 
 - 后端：FastAPI + SQLAlchemy + SQLite
-- 前端：Vue 3 + Vite + Element Plus + ECharts
+- 前端：Vue 3 + Vite + TypeScript + Element Plus + ECharts
 - 模型：任意 Anthropic / OpenAI 兼容接口（默认 DeepSeek）
 
 ---
@@ -95,9 +95,15 @@ Blossoms/
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
-│   ├── src/views/              # 6 个页面
-│   ├── src/api/index.js        # 接口层（含 SSE 解析）
-│   └── vite.config.js          # dev 代理 → 127.0.0.1:8000
+│   ├── src/main.ts             # 入口：挂载应用、注册 Element Plus 与图标
+│   ├── src/api/index.ts        # 接口层（含 SSE 流式解析），响应体全部有类型
+│   ├── src/api/types.ts        # 与后端 models.py 对齐的 DTO 定义
+│   ├── src/router/index.ts     # 路由表，页面级懒加载
+│   ├── src/views/              # 7 个页面
+│   ├── eslint.config.js        # ESLint 扁平配置（JS + TS + Vue）
+│   ├── .prettierrc.json        # 代码风格
+│   ├── tsconfig.json
+│   └── vite.config.js          # dev 代理 → 127.0.0.1:8000，生产分包策略
 ├── samples/                    # 演示样例包（合成数据，见下）
 ├── scripts/
 │   ├── verify_llm.py           # 模型通道健康检查（换模型必跑）
@@ -149,6 +155,20 @@ cd frontend
 npm install
 npm run dev               # http://127.0.0.1:3000，/api 代理到 8000
 ```
+
+代码质量检查（提交前跑一遍，三项全绿才算干净）：
+
+```bash
+npm run verify            # = typecheck + lint
+npm run format            # Prettier 统一格式
+```
+
+| 脚本 | 作用 |
+|---|---|
+| `npm run typecheck` | `vue-tsc --noEmit`，含 `.vue` 的模板类型检查 |
+| `npm run lint` | ESLint（`@eslint/js` + `typescript-eslint` + `eslint-plugin-vue`） |
+| `npm run format` | Prettier 格式化，规则见 `.prettierrc.json` |
+| `npm run verify` | 上面两项串联，CI 可用 |
 
 ### 3. 单端口运行（演示 / 部署推荐）
 
@@ -242,7 +262,35 @@ samples/expected/期望结果.md                                        # 15 个
 
 ---
 
-## 八、常见问题
+## 八、前端工程化
+
+这一节单独列出来，是因为本赛项「作品须以前端 Web 应用为主要呈现形态」——前端不是壳，是交付物本身。
+
+**类型分层**：`src/api/types.ts` 把后端 DTO 集中定义一次，`src/api/index.ts` 里每个方法都带泛型返回值。
+调用方拿到的是 `AxiosResponse<DocumentListResult>`，字段写错在编辑器里就报红，不用等运行。
+
+**规范与检查**：
+
+| 手段 | 配置 | 现状 |
+|---|---|---|
+| TypeScript | `tsconfig.json`（`strict` + `verbatimModuleSyntax`） | `main` / `api` / `router` 已迁移；`vue-tsc --noEmit` 零错误 |
+| ESLint | `eslint.config.js`（扁平配置，JS + TS + Vue 三套规则叠加） | 零 error 零 warning |
+| Prettier | `.prettierrc.json`（无分号 / 单引号 / 110 列） | 全仓 `--check` 通过 |
+| 编辑器一致性 | `.editorconfig` 风格由 Prettier 统一 | — |
+
+**性能**：
+
+- 路由级懒加载：7 个页面全部 `() => import()`，首屏只加载登录页。
+- vendor 分包：`vite.config.js` 里按 `element-plus` / `echarts` / `vue` 拆成三个 chunk，
+  业务代码发版时 vendor 的 hash 不变，可继续命中强缓存。
+- 构建结果：入口 chunk 4.4 kB（gzip 2.0 kB），最大页面 chunk 23.6 kB（gzip 8.1 kB）。
+
+**AI 交互**：`chatApi.askStream` 用 `fetch` + `ReadableStream` 手写 SSE 解析（`EventSource` 不支持
+POST 与自定义头），按空行切分事件、容忍网络半包，逐 token 渲染；`AbortController` 支持中途停止。
+
+---
+
+## 九、常见问题
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -255,17 +303,19 @@ samples/expected/期望结果.md                                        # 15 个
 
 ---
 
-## 九、已知限制
+## 十、已知限制
 
 - 单机 SQLite，未做并发压测；多用户高频写入场景需换 PostgreSQL。
 - 内测阶段所有账号被统一提升为 `admin`（`main.py` 内显式标注），正式使用需按角色收口。
 - `CORS` 目前放开为 `*`，公网部署前应改为白名单。
 - 旧版 `.doc`、扫描版 PDF（需 OCR）不在支持范围内。
 - 模板识别基于表头文本与结构启发式，极端非标准模板仍可能需要人工指定映射。
+- 前端为**渐进式 TypeScript**：`main` / `api` / `router` 已迁移，`views` 与 `components` 仍是
+  `.vue` 内的 JS（`checkJs: false`），后续按页面逐个补类型。
 
 ---
 
-## 十、开发辅助脚本
+## 十一、开发辅助脚本
 
 | 脚本 | 用途 |
 |---|---|
@@ -279,4 +329,6 @@ samples/expected/期望结果.md                                        # 15 个
 
 ## 许可证
 
-当前仓库尚未添加 LICENSE 文件，提交公开仓库前请补充（建议 MIT 或 Apache-2.0）。
+MIT，见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 郑铭创、叶子豪、刘沛嫣（广州软件学院 · Blossoms pave your way 团队）
