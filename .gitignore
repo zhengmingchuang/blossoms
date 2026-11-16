@@ -1,5 +1,7 @@
 # 环境配置
 backend/.env
+# 首次启动生成的随机管理员口令（仅本机可读）
+backend/.admin_initial_password
 
 # 数据库
 backend/app.db
@@ -16,10 +18,15 @@ backend/vector_store/chunks.json
 __pycache__/
 *.pyc
 *.pyo
+# 虚拟环境（体积大且与平台绑定，不能进仓库）
+.venv/
+venv/
 
 # Node
 node_modules/
 frontend/dist/
+# 旧构建产物备份（dist_prev_1415 等），可随时由源码重建
+frontend/dist_prev*/
 
 # IDE
 .vscode/
@@ -37,6 +44,10 @@ _tpl_headers.json
 
 # 数据库备份
 backend/*.db.bak*
+backend/backups/
+
+# 测试遗留的临时文档
+backend/.workbuddy-ai_test.docx
 
 # PDF 构建中间产物
 docs/.build/
@@ -47,3 +58,9 @@ docs/*.mp4
 
 # 工具临时产物
 .slidep/
+
+# 测试脚本：fill_regression / adversarial_* 只依赖已入库的 samples/，且口令从环境变量读取，随仓库发布。
+# demo_testset_* 依赖未入库的第三方测试集（docs/demo测试集/），单独排除。
+scripts/demo_testset_*.py
+# 演示测试集：含第三方数据（COVID-19 / 城市百强 / 空气质量），授权未确认
+docs/demo测试集/

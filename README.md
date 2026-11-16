@@ -37,11 +37,13 @@ DocFusion 面向「**多源文档 → 结构化指标 → 模板填报**」这�
 | 语义检索 | sentence-transformers 向量检索，缺依赖时自动降级 TF-IDF + jieba 分词 | `services/vector_store.py` |
 | 模板识别 | 自动判定 `table_fill`（表头批量填）/ `field_fill`（字段填空），支持 docx 多表 | `services/template_filler.py` |
 | 表格填报 | 列名语义映射、脏数据清洗、伪合计行剔除、行政区后缀归一化、求和/极值/均值列 | `routers/templates.py`、`services/smart_fill.py` |
+| 条件解析 | 规则 + LLM **双路**：规则认固定句式（精确、零成本、可解释），规则落不了地时由 LLM 兜底（能听懂「达到五万亿」「别低于五万亿」）；数值比较、日期区间、精确匹配、分组都走这条链 | `services/data_filter.py`（`merge_numeric_filters`） |
 | 图片填充 | Excel 图片占位符：WPS `DISPIMG` 单元格图片 + openpyxl 浮动图片 | `services/image_filler.py` |
-| 文档编辑 | 12 个 Agent 工具（改文档 / 排版 / 建表 / 加图表 / 校验表格 / 智能填表），自然语言驱动 | `services/doc_editor.py` |
+| 文档编辑 | 13 个 Agent 工具（改文档 / 排版 / 建表 / 建报告文档 / 加图表 / 校验表格 / 智能填表），自然语言驱动 | `services/doc_editor.py` |
+| 报告生成 | 从结构化描述直接产出 .docx：标题层级、Word 表格、matplotlib 渲染的中文图表 | `services/doc_builder.py` |
 | 智能对话 | SSE 流式输出、工具调用步骤实时回显、可中断 | `routers/chat.py` |
 | MCP 服务 | 13 个工具经 MCP 协议对外暴露（HTTP + SSE / JSON-RPC） | `services/mcp_service.py` |
-| 开放接口 | `/api/openapi/*` 供外部系统调用抽取能力 | `routers/openapi.py` |
+| 开放接口 | `/api/open/*` 供外部系统调用抽取能力（Header `X-API-Key`） | `routers/openapi.py` |
 
 ---
 
@@ -79,6 +81,7 @@ flowchart LR
 1. **样式保真优先**：填表不重建文档，而是复制模板文件后只写单元格 / 段落值，合并单元格、字体、列宽、图片一律不动。
 2. **模型可插拔**：`llm_service` 同时实现 Anthropic 与 OpenAI 两种协议，切换供应商只改配置，不改代码；`LLM_DISABLE_THINKING` 默认关闭思考模式，避免 `temperature=0` 失效与多轮工具调用 400。
 3. **LLM 只做它擅长的事**：数值清洗、去重、合计行剔除、单位归一化全走规则，LLM 只负责语义映射与自然语言抽取，成本与稳定性都可控。
+4. **语义理解要能兜住规则**：规则精确但只认固定句式，用户说「达到五万亿」就漏。所以条件解析做成双路——规则优先，规则解析不出可落地条件时才问模型，并在结果页标注「该条件由模型解析，请核对」。纯规则会在措辞变化时静默失效，纯 LLM 会幻觉阈值，两者互补才可靠。
 
 ---
 
@@ -142,7 +145,7 @@ cp .env.example .env      # 然后填入 LLM_API_KEY
 python main.py            # 默认 http://127.0.0.1:8000
 ```
 
-首次启动会自动建表、创建管理员 **admin / admin123**（请自行修改）。
+首次启动会自动建表并创建管理员 `admin`。初始口令取环境变量 `ADMIN_INIT_PASSWORD`；未设置时系统生成一次性随机口令并写入 `backend/.admin_initial_password`（仅本机可读），首次登录后请立即修改口令并删除该文件。
 
 > `requirements.txt` **默认不含** `sentence-transformers`（它会连带安装 PyTorch，约 2 GB）。
 > 不装也能跑通全部主流程——`services/vector_store.py` 捕获 ImportError 后自动降级为 TF-IDF 检索。
@@ -294,20 +297,26 @@ POST 与自定义头），按空行切分事件、容忍网络半包，逐 token
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| 页面白屏，控制台报 `Expected a JavaScript-or-Wasm module script but the server responded with a MIME type of "text/plain"` | Windows 注册表把 `.js` 注册成了 `text/plain`，浏览器对 `type="module"` 强制校验 MIME 而拒绝执行。`main.py::_fix_mimetypes()` 已在进程启动时显式钉死 `.js/.mjs/.css/.map/.woff2` 等类型，自定义启动入口时不要漏掉这个调用 |
 | 改完 `.env` 模型没变 | 数据库 `system_config` 覆盖了它，去设置页再保存一次 |
 | 启动报 `address already in use` | 8000 被占用（常见于上次没退干净），换端口或结束旧进程 |
 | 前端 3000 端口接口全 404 | 后端没起，或后端端口不是 8000；可用 `VITE_API_TARGET` 指定 |
 | `.doc` 解析失败 | 未安装 LibreOffice，跑 `scripts/install_libreoffice.ps1` |
 | 首次对话很慢 | 嵌入模型在下载；或模型未关闭思考模式 |
 | 会话里出现别人的历史消息 | 已修（开启 SQLite 外键 + 删会话时级联删消息），旧库需清理孤儿数据 |
+| 某个 `.xlsx` 上传后提示「未解析到任何内容」 | 该文件可能是 **Strict Open XML**（`conformance="strict"`，命名空间为 `purl.oclc.org`）。openpyxl 只认 Transitional，会把这种包读成「零个工作表」。上传时 `services/ooxml_compat.py` 已自动就地转换；若绕过上传接口直接放文件进 `uploads/`，需自己先另存为普通 xlsx |
+| 填表结果里出现 `4985(PF)`、`16(H)` 这类值 | 源数据自带质量标记，系统按原样保留而不抹成纯数字——抹掉会把异常读数伪装成正常值 |
+| 说了「GDP 超过 5 万亿」却填回全表 100 行 | 数值条件的**关键字**带了动作词（`填写GDP`/`帮我填GDP`），匹配不到模板列 `GDP总量（亿元）`，条件被当成「无法落地」静默丢弃。`data_filter._KW_LEAD_RE` 已剥离填表类动词，`_match_filter_column` 增加「列名主体 ⊂ 关键字」与逐字剥前缀两级兜底。若条件确实落不到任何列，结果页会显式告警而不是静默返回全表 |
+| 结果卡片刚出现时截图是空白 | 结果卡片有 `0.15s` 延迟 + `0.4s` 的 `card-in` 入场动画（`opacity: 0 → 1`）。自动化截图需等动画结束（约 1.5s）再拍，否则会拍到半透明状态 |
+| 拿着 `backend/.admin_initial_password` 里的口令登录，一直 401 | 加固脚本轮换口令时「先写库再写文件」，中途异常或库被占用就会错位：文件是新的、库里还是旧哈希。执行 `python scripts/reset_admin_password.py` 重置——它会在写文件前回读校验，确保两边一致 |
 
 ---
 
 ## 十、已知限制
 
 - 单机 SQLite，未做并发压测；多用户高频写入场景需换 PostgreSQL。
-- 内测阶段所有账号被统一提升为 `admin`（`main.py` 内显式标注），正式使用需按角色收口。
-- `CORS` 目前放开为 `*`，公网部署前应改为白名单。
+- 角色模型：新注册用户为 `user`，管理员需显式提升。升级旧库时请执行一次 `UPDATE users SET role='user' WHERE username != 'admin'`，把此前内测期被自动提权的账号降回普通用户。
+- `CORS` 默认只放行本地开发端口，公网部署用 `CORS_ORIGINS` 显式配置允许的来源。
 - 旧版 `.doc`、扫描版 PDF（需 OCR）不在支持范围内。
 - 模板识别基于表头文本与结构启发式，极端非标准模板仍可能需要人工指定映射。
 - 前端为**渐进式 TypeScript**：`main` / `api` / `router` 已迁移，`views` 与 `components` 仍是
