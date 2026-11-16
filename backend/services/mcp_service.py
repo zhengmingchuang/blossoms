@@ -1,5 +1,5 @@
 import json
-from typing import List, Dict, Any
+from typing import Dict
 from services import vector_store
 from services.extractor import hybrid_extract, rule_extract
 
@@ -407,7 +407,6 @@ async def _generate_report(topic, file_ids, user_id):
 
 
 async def _fill_template_auto(template_id, requirement, user_id):
-    import requests
     from database import SessionLocal
     from models import TemplateInfo
     db = SessionLocal()
@@ -419,7 +418,7 @@ async def _fill_template_auto(template_id, requirement, user_id):
             t.user_requirement = requirement
             db.commit()
         return json.dumps({
-            "message": f"请在模板填报页面点击「自动填写」按钮执行填充",
+            "message": "请在模板填报页面点击「自动填写」按钮执行填充",
             "template_id": template_id,
             "template_name": t.template_name,
             "mode": t.template_mode or "field_fill",

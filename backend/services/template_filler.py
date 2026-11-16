@@ -2,10 +2,32 @@
 import re
 import os
 import copy
+import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import openpyxl
 import docx
+
+from services.unit_normalize import normalize_cell
+
+logger = logging.getLogger(__name__)
+
+_UNIT_WARNED: set = set()
+
+
+def _warn_unit_once(msg: str, key: str = "") -> None:
+    """同一列的单位告警只记一次，避免逐格刷日志。
+
+    去重键用列名而不是完整消息：消息里带着具体数值，按消息去重等于没去重
+    （「7.3万元」「5.2万元」各算一条），一列上千行就能把日志刷满。
+    """
+    k = key or msg
+    if k in _UNIT_WARNED:
+        return
+    if len(_UNIT_WARNED) > 500:  # 极端模板列数多时兜底，防止长期运行无限增长
+        _UNIT_WARNED.clear()
+    _UNIT_WARNED.add(k)
+    logger.warning(f"[template_filler] 单位告警：{msg}")
 
 
 def identify_fields(file_path: str) -> Dict[str, Any]:
@@ -127,6 +149,27 @@ def _identify_xls(fp: str) -> Dict[str, Any]:
     return {"mode": "table_fill", "format": "xlsx", "sheet": first_sn, "columns": [], "start_row": 2, "fields": []}
 
 
+_PLAIN_NUM_RE = re.compile(r"^[-+]?[\d,，]+(\.\d+)?$")
+_NUM_UNIT_RE = re.compile(
+    r"^[-+]?[\d,，]+(\.\d+)?\s*[%％元万亿人个吨千克米度℃小时分钟天年月日kmgl/]+$"
+)
+_DATE_ONLY_RE = re.compile(
+    r"^\d{4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}$|^\d{4}\s*年\s*\d{1,2}\s*月(\s*\d{1,2}\s*日)?$"
+)
+
+
+def _is_numeric_or_date_text(text: str) -> bool:
+    """判断一段表头候选文本其实是「数据」而不是「名称」。
+
+    只认三种确定形态：纯数字、数字+单位、纯日期。
+    「2020年确诊」这种以数字开头但带业务词的列名不算数据，不能被误杀。
+    """
+    s = str(text or "").strip().replace(" ", "")
+    if not s:
+        return False
+    return bool(_PLAIN_NUM_RE.match(s) or _NUM_UNIT_RE.match(s) or _DATE_ONLY_RE.match(s))
+
+
 def _resolve_merged_value(ws, row: int, col: int):
     """解析合并单元格：如果 (row,col) 在合并区域内，返回左上角单元格的值。"""
     for rng in ws.merged_cells.ranges:
@@ -137,6 +180,8 @@ def _resolve_merged_value(ws, row: int, col: int):
 
 def _scan_one_sheet(ws, sn: str) -> Optional[Dict[str, Any]]:
     """扫描单个 sheet 检测表头，返回该 sheet 的模板信息或 None。"""
+    from openpyxl.utils import get_column_letter
+
     if ws.max_row is None or ws.max_row < 1:
         return None
 
@@ -159,7 +204,7 @@ def _scan_one_sheet(ws, sn: str) -> Optional[Dict[str, Any]]:
                 continue
             if len(text) > 200 and '\n' in text:
                 continue
-            row_cells.append({"col": cell.column, "col_letter": cell.column_letter, "name": text})
+            row_cells.append({"col": cell.column, "col_letter": get_column_letter(cell.column), "name": text})
 
         if len(row_cells) < 2:
             continue
@@ -187,11 +232,48 @@ def _scan_one_sheet(ws, sn: str) -> Optional[Dict[str, Any]]:
             if v is not None:
                 text = re.sub(r'[\s\u3000]+', ' ', str(v)).strip()
                 if text:
-                    best_header_cells.append({"col": cell.column, "col_letter": cell.column_letter, "name": text})
+                    best_header_cells.append({"col": cell.column, "col_letter": get_column_letter(cell.column), "name": text})
         best_header_row_idx = 1
 
     if not best_header_cells:
         return None
+
+    # 两行表头：上行是大类（通常带跨列合并），下行才是具体指标。
+    # 不做这一步，下行会被当成「表头下面已经有数据」，整个模板被判成字段模式，
+    # 列全丢——用户上传一个合并表头的 Excel，看到的是「识别到 0 列」。
+    _merged_span_cols = {
+        c
+        for rng in ws.merged_cells.ranges
+        if rng.min_row == best_header_row_idx and rng.max_col > rng.min_col
+        for c in range(rng.min_col, rng.max_col + 1)
+    }
+    if _merged_span_cols and best_header_row_idx < ws.max_row:
+        _sub_cells = []
+        _sub_filled = 0
+        _sub_is_text = 0
+        for h in best_header_cells:
+            v = _resolve_merged_value(ws, best_header_row_idx + 1, h["col"])
+            text = re.sub(r'[\s\u3000]+', ' ', str(v)).strip() if v is not None else ""
+            if text and len(text) <= 200:
+                _sub_cells.append({"col": h["col"], "col_letter": h["col_letter"], "name": text})
+                if h["col"] in _merged_span_cols:
+                    _sub_filled += 1
+                    # 子表头必须是「名称」而不是数据：纯数字、日期、带单位的数值都算数据。
+                    # 少了这一条，「城市名/上海/56700」这种第一行数据会被当成子表头。
+                    if not _is_numeric_or_date_text(text):
+                        _sub_is_text += 1
+            else:
+                _sub_cells.append(dict(h))
+        # 只有「合并区里的列在下一行确实都是文字名称」时才认作两行表头，
+        # 否则可能把第一行数据误当成子表头。
+        _span_total = len([c for c in best_header_cells if c["col"] in _merged_span_cols])
+        if _sub_filled and _sub_filled == _span_total and _sub_is_text == _span_total:
+            logger.info(
+                f"[identify] 检测到两行表头（第 {best_header_row_idx}/{best_header_row_idx + 1} 行），"
+                f"列名取第二行：{[c['name'] for c in _sub_cells]}"
+            )
+            best_header_cells = _sub_cells
+            best_header_row_idx += 1
 
     empty_rows = 0
     has_data_below = False
@@ -337,7 +419,6 @@ def _identify_docx_open(fp: str) -> Dict[str, Any]:
         raw_cells = [c.text.strip() for c in table.rows[0].cells]
         # python-docx 对合并单元格会返回重复的 cell 对象，需要去重
         header_cells = []
-        seen_texts = set()
         for i, text in enumerate(raw_cells):
             # 如果同一个文本连续出现，说明是合并单元格，只保留第一个
             if i > 0 and text == raw_cells[i-1]:
@@ -348,7 +429,6 @@ def _identify_docx_open(fp: str) -> Dict[str, Any]:
             continue
         # 检查后续行是否为空
         empty_data_rows = 0
-        total_data_rows = len(table.rows) - 1
         for ri in range(1, len(table.rows)):
             row_vals = [c.text.strip() for c in table.rows[ri].cells]
             if not any(row_vals):
@@ -459,25 +539,154 @@ def fill_template(
     raise ValueError(f"不支持: {ext}")
 
 
-def fill_table_template(template_path: str, output_path: str, rows_data: Any, template_info: Dict, src_file: str = None, sum_config: Dict = None, stats_config: Dict = None) -> str:
+def fill_table_template(template_path: str, output_path: str, rows_data: Any, template_info: Dict, src_file: str = None, sum_config: Dict = None, stats_config: Dict = None, stats_out: Optional[Dict[str, Any]] = None) -> str:
     """表格批量填充模式：将多行数据写入模板。
     
     rows_data: List[Dict] 或 Dict[sheet_name, List[Dict]] - 要填入的数据行
     src_file: 数据源文件路径（用于图片填充）
     sum_config: {"row": bool, "col": bool} - 是否需要行/列求和
     stats_config: {"avg": bool, "max": bool, "min": bool} - 统计行
+    stats_out: 出参。写入过程中发现「哪些表/列因为完全没数据而保持原样」，
+               由调用方转成面向用户的告警。静默保留和静默清空一样糟糕——
+               用户看到空表时无法判断是数据没有、还是系统吃掉了。
     """
     fmt = template_info.get("format", "xlsx")
     if fmt == "xlsx":
         if template_info.get("multi_sheet") and template_info.get("sheets"):
-            return _fill_xlsx_multi_sheet(template_path, output_path, rows_data, template_info, src_file=src_file, sum_config=sum_config, stats_config=stats_config)
+            return _fill_xlsx_multi_sheet(template_path, output_path, rows_data, template_info, src_file=src_file, sum_config=sum_config, stats_config=stats_config, stats_out=stats_out)
         return _fill_xlsx_table(template_path, output_path, rows_data, template_info, src_file=src_file, sum_config=sum_config, stats_config=stats_config)
     elif fmt == "docx":
-        return _fill_docx_table(template_path, output_path, rows_data, template_info)
+        return _fill_docx_table(template_path, output_path, rows_data, template_info, stats_out=stats_out)
     raise ValueError(f"不支持的模板格式: {fmt}")
 
 
-def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_file: str = None, sum_config: Dict = None, stats_config: Dict = None) -> str:
+_DATE_HDR_RE = re.compile(r"(日期|时间|date|datetime|月份|年月)", re.I)
+_DT_PATTERNS = (
+    "%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y年%m月%d日",
+    "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+    "%Y/%m", "%Y-%m", "%Y年%m月", "%Y",
+)
+
+
+def _try_parse_datetime(v) -> bool:
+    import datetime as _dt
+
+    s = str(v or "").strip()
+    if not s:
+        return False
+    s = s.split(".")[0] if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+", s) else s
+    for fmt in _DT_PATTERNS:
+        try:
+            _dt.datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_date_like_series(values: List[Any], sample: int = 40, ratio: float = 0.8) -> bool:
+    seen = ok = 0
+    for v in values[:sample]:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        seen += 1
+        if _try_parse_datetime(s):
+            ok += 1
+    return seen >= 3 and ok / seen >= ratio
+
+
+def _fmt_date_cell(v: Any) -> str:
+    """把日期值写成「2020-07-01」这种可读形式。
+
+    源数据里的日期是 datetime，直接 str() 会得到「2020-07-01 00:00:00」，
+    在表格里既占宽又难看，且用户按字符串筛日期时容易漏。带时分秒且非零的
+    才保留时间部分，避免丢掉真实精度。
+    """
+    if hasattr(v, "strftime"):
+        try:
+            if getattr(v, "hour", 0) or getattr(v, "minute", 0) or getattr(v, "second", 0):
+                return v.strftime("%Y-%m-%d %H:%M:%S")
+            return v.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    s = str(v).strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T]00:00:00(\.0+)?$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return s
+
+
+def _pick_extra_date_column(columns: List[str], rows: List[Dict]) -> Optional[str]:
+    """模板没有日期列、但数据行里带着日期时，返回那个数据列名。
+
+    C 用例（COVID-19）就是这种情况：模板 6 列没有日期，源数据是「国家 × 62 天」，
+    按行写进去后同一国家连续 62 行完全一样，用户看不出哪行是哪天——数据逐格都对，
+    表却不可用。解决办法不是替用户决定聚合口径（求和/均值/取末日，口径不定），
+    而是把日期作为一列显式追加，信息不丢失，用户自己可以再聚合。
+    """
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    col_set = {str(c) for c in columns}
+    if any(_DATE_HDR_RE.search(c) for c in col_set):
+        return None  # 模板本来就有日期列，不重复加
+    # 必须扫所有行的键，不能只看 rows[0]：排序后首行可能是「不带日期的那批行」
+    # （C 用例里中国省级行来自 docx，没有日期列），只看首行会漏判。
+    seen_keys: List[str] = []
+    for r in rows[:200]:
+        if not isinstance(r, dict):
+            continue
+        for k in r.keys():
+            if str(k) not in seen_keys:
+                seen_keys.append(str(k))
+    for k in seen_keys:
+        if k in col_set or not _DATE_HDR_RE.search(k):
+            continue
+        vals = [r.get(k) for r in rows if isinstance(r, dict)]
+        if _is_date_like_series(vals):
+            return k
+    return None
+
+
+def _table_column_coverage(columns: List[str], rows: List[Dict]) -> Dict[str, int]:
+    """统计每列有多少行能取到值。第一列（实体名）不参与判断。
+
+    用于区分两种「空」：
+      - 这张表本来就没有数据 → 不要写，保持模板原样；
+      - 表里有数据，但某一列全空 → 正常写入 + 告警。
+    不区分就会退化成「整表被抹成表头」。
+    """
+    cov: Dict[str, int] = {}
+    for c in columns[1:] or columns:
+        n = 0
+        for r in rows:
+            if isinstance(r, dict):
+                v = _docx_row_fuzzy_get(r, c)
+                if v is not None and str(v).strip() != "":
+                    n += 1
+        cov[c] = n
+    return cov
+
+
+def _rows_for_table(columns: List[str], rows: List[Dict]) -> List[Dict]:
+    """只保留「对这张表真的有信息」的行。
+
+    判定标准：该表除首列外至少有一列能取到非空值。否则这行对这张表只是
+    一个孤零零的实体名，写进去等于用空白覆盖模板。
+    """
+    out: List[Dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        for c in (columns[1:] or columns):
+            v = _docx_row_fuzzy_get(r, c)
+            if v is not None and str(v).strip() != "":
+                out.append(r)
+                break
+    return out
+
+
+def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_file: str = None, sum_config: Dict = None, stats_config: Dict = None, stats_out: Optional[Dict[str, Any]] = None) -> str:
     """多表单填充：遍历每个 sheet 的模板信息，分别填充对应数据。
     功能与 _fill_xlsx_table 对齐：安全写入、千分位处理、DISPIMG 保留、自动小计、行列求和。
 
@@ -489,7 +698,7 @@ def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_fil
     wb = openpyxl.load_workbook(tp)
     sheets = info.get("sheets", [])
 
-    def _ms_safe_write(cell, val):
+    def _ms_safe_write(cell, val, header=""):
         if type(cell).__name__ == 'MergedCell':
             return
         s = str(val).strip()
@@ -497,6 +706,14 @@ def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_fil
             return
         if _has_dispimg(s):
             cell.value = s
+            return
+        # 单位以表头为准：带单位的值换算成表头声明单位的纯数值
+        norm_val, unit_warn = normalize_cell(val, header)
+        if unit_warn:
+            _warn_unit_once(unit_warn, header)
+        if isinstance(norm_val, (int, float)) and not isinstance(norm_val, bool):
+            fval = float(norm_val)
+            cell.value = int(fval) if fval == int(fval) else fval
             return
         s_num = s.replace(",", "").replace("\uff0c", "")
         try:
@@ -526,6 +743,16 @@ def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_fil
                     sheet_rows.append(row)
 
         if not sheet_rows:
+            # 保留该 sheet 原样，但要留痕：否则用户看到的是一张空表，
+            # 分不清是「数据里没有」还是「系统没填」。
+            if stats_out is not None:
+                stats_out.setdefault("untouched_tables", []).append({
+                    "label": f"工作表「{sn}」",
+                    "table_index": sn,
+                    "columns": list(col_names),
+                    "reason": "所有指标列在本次数据中都没有取值",
+                })
+            logger.warning("[template_filler] sheet %s 无对应数据，保持模板原样", sn)
             continue
 
         _tpl_row = start_row
@@ -567,7 +794,7 @@ def _fill_xlsx_multi_sheet(tp: str, op: str, rows_data: Any, info: Dict, src_fil
                     target.number_format = tpl_cell.number_format
 
                 if val:
-                    _ms_safe_write(target, val)
+                    _ms_safe_write(target, val, col_name)
 
             if sub_col_letter and qty_col_name and price_col_name and isinstance(row, dict):
                 try:
@@ -641,7 +868,6 @@ def _has_dispimg(v: str) -> bool:
 
 def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: str = None, sum_config: Dict = None, stats_config: Dict = None) -> str:
     """xlsx 表格批量填充：在表头下方逐行写入数据，支持图片填充、行列求和及统计公式"""
-    import openpyxl.cell.cell as _cell_mod
     wb = openpyxl.load_workbook(tp)
     sn = info.get("sheet", wb.sheetnames[0])
     ws = wb[sn]
@@ -678,7 +904,7 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
             tpl = ws[f"{col_letter}{_template_style_row}"]
             _copy_cell_style(target, tpl)
 
-    def _safe_write(cell, val):
+    def _safe_write(cell, val, header=""):
         """安全写入单元格，跳过合并单元格的从属格"""
         if type(cell).__name__ == 'MergedCell':
             return
@@ -687,6 +913,14 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
             return
         if _has_dispimg(s):
             cell.value = s
+            return
+        # 单位以表头为准：带单位的值换算成表头声明单位的纯数值
+        norm_val, unit_warn = normalize_cell(val, header)
+        if unit_warn:
+            _warn_unit_once(unit_warn, header)
+        if isinstance(norm_val, (int, float)) and not isinstance(norm_val, bool):
+            fval = float(norm_val)
+            cell.value = int(fval) if fval == int(fval) else fval
             return
         # 去除千分位逗号后尝试数值转换，避免 "14,415.90" 被存为文本导致 SUM 失效
         s_num = s.replace(",", "").replace("，", "")
@@ -779,7 +1013,7 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
                 val = _fuzzy_get(row_dict, col_name)
                 if val is not None and str(val).strip():
                     cell = ws[f"{col_letter}{excel_row}"]
-                    _safe_write(cell, val)
+                    _safe_write(cell, val, col_name)
             # 自动计算 SUB = Quantity × Unit Price
             if sub_col_letter and qty_col_name and price_col_name:
                 try:
@@ -806,7 +1040,7 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
                     col_letter = columns[ci]["col_letter"]
                     if val is not None and str(val).strip():
                         cell = ws[f"{col_letter}{excel_row}"]
-                        _safe_write(cell, val)
+                        _safe_write(cell, val, columns[ci].get("name", ""))
 
     # 自动加宽 SUB 列，避免 ###### 显示
     if sub_col_letter:
@@ -821,6 +1055,42 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
     data_row_count = len(rows_data)
     last_data_row = start_row + data_row_count - 1
     header_row_idx = info.get("header_row", start_row - 1)
+
+    # ---- 模板缺日期列时自动追加「日期」列 ----
+    # 不追加的话，同一天的多行在表里完全一样，用户无法区分——数据对、表不可用。
+    # 不替用户选聚合口径（求和/均值/取末日无法自动判定），只把日期显式化。
+    extra_date_key = _pick_extra_date_column([c.get("name", "") for c in columns], rows_data)
+    if extra_date_key:
+        from openpyxl.utils import get_column_letter as _gl_date
+
+        _max_col = max((c.get("col", 1) for c in columns), default=1)
+        _date_col_num = _max_col + 1
+        if sum_config and sum_config.get("row"):
+            _date_col_num += 1  # 让开「合计」列
+        _date_letter = _gl_date(_date_col_num)
+        _first_letter = next((c.get("col_letter") for c in columns if c.get("col_letter")), "A")
+        _hdr_cell = ws[f"{_date_letter}{header_row_idx}"]
+        _hdr_cell.value = "日期"
+        _copy_cell_style(_hdr_cell, ws[f"{_first_letter}{header_row_idx}"])
+        _written = 0
+        for ri, _row in enumerate(rows_data):
+            _v = _row.get(extra_date_key) if isinstance(_row, dict) else None
+            if _v is None or str(_v).strip() == "":
+                continue
+            _cell = ws[f"{_date_letter}{start_row + ri}"]
+            _cell.value = _fmt_date_cell(_v)
+            _copy_cell_style(_cell, ws[f"{_first_letter}{_template_style_row}"])
+            _written += 1
+        try:
+            ws.column_dimensions[_date_letter].width = max(
+                ws.column_dimensions[_date_letter].width or 10, 20
+            )
+        except Exception:
+            pass
+        logger.info(
+            "[template_filler] 模板无日期列，已在最右侧（%s 列）追加「日期」，写入 %s 行",
+            _date_letter, _written,
+        )
 
     if sum_config and data_row_count > 0:
         from openpyxl.utils import get_column_letter
@@ -944,7 +1214,7 @@ def _fill_xlsx_table(tp: str, op: str, rows_data: list, info: Dict, src_file: st
     return op
 
 
-def _fill_docx_table(tp: str, op: str, rows_data: list, info: Dict) -> str:
+def _fill_docx_table(tp: str, op: str, rows_data: list, info: Dict, stats_out: Optional[Dict[str, Any]] = None) -> str:
     """docx 表格批量填充：在每个表格的空行中写入数据"""
     doc = docx.Document(tp)
     tables_info = info.get("tables", [])
@@ -957,25 +1227,70 @@ def _fill_docx_table(tp: str, op: str, rows_data: list, info: Dict) -> str:
     # 1. 单个 List[Dict] -> 填入所有表格（按表格描述筛选）
     # 2. Dict[table_index -> List[Dict]] -> 按表格索引分配
 
+    def _note_untouched(tinfo: Dict, reason: str) -> None:
+        if stats_out is None:
+            return
+        ti = tinfo.get("table_index")
+        stats_out.setdefault("untouched_tables", []).append({
+            "label": f"表{int(ti) + 1}" if isinstance(ti, int) else f"表{ti}",
+            "table_index": ti,
+            "columns": list(tinfo.get("columns") or []),
+            "reason": reason,
+        })
+
+    def _note_empty_columns(tinfo: Dict, cov: Dict[str, int]) -> None:
+        empty = [c for c, n in cov.items() if n == 0]
+        if not empty or stats_out is None:
+            return
+        ti = tinfo.get("table_index")
+        stats_out.setdefault("empty_columns", []).append({
+            "label": f"表{int(ti) + 1}" if isinstance(ti, int) else f"表{ti}",
+            "table_index": ti,
+            "columns": empty,
+        })
+
+    def _write_one(tinfo: Dict, t_rows: List[Dict]) -> None:
+        ti = tinfo["table_index"]
+        if ti >= len(doc.tables):
+            return
+        cols = list(tinfo["columns"])
+        cov = _table_column_coverage(cols, t_rows)
+        # 除首列外整表都没有数据：这张表本来就没有可填内容。
+        # 此时写进去只会得到「一列实体名 + 其余空白」，把模板原有内容覆盖掉。
+        if cols and all(n == 0 for n in cov.values()):
+            _note_untouched(tinfo, "所有指标列在本次数据中都没有取值")
+            logger.warning(
+                "[template_filler] 表%s 的指标列 %s 全都没有数据，保持模板原样不写入",
+                ti, [c for c in cols[1:] or cols],
+            )
+            return
+        _note_empty_columns(tinfo, cov)
+        if not t_rows:
+            _note_untouched(tinfo, "没有能对应到该表列的数据行")
+            return
+        # 写入起点要避让用户已经填过的真实内容：模板里预填的数据不能被静默覆盖。
+        _start = _first_writable_row(doc.tables[ti], tinfo.get("start_row", 1))
+        _write_docx_table(doc.tables[ti], tinfo["columns"], t_rows, _start)
+
     if isinstance(rows_data, dict):
         # 按表格索引分配
         for tinfo in tables_info:
             ti = tinfo["table_index"]
             t_rows = rows_data.get(ti, rows_data.get(str(ti), []))
-            if t_rows and ti < len(doc.tables):
-                _write_docx_table(doc.tables[ti], tinfo["columns"], t_rows, tinfo.get("start_row", 1))
+            if t_rows:
+                _write_one(tinfo, t_rows)
+            else:
+                _note_untouched(tinfo, "本次填充没有分配到该表的数据行")
     elif isinstance(rows_data, list):
         # 如果只有一个表格，直接填
         if len(tables_info) == 1:
-            ti = tables_info[0]["table_index"]
-            if ti < len(doc.tables):
-                _write_docx_table(doc.tables[ti], tables_info[0]["columns"], rows_data, tables_info[0].get("start_row", 1))
+            _write_one(tables_info[0], rows_data)
         else:
-            # 多个表格，rows_data 应该是按表格分组的
+            # 多个表格：**按表分别取行**。
+            # 旧实现把同一批行原样写进每张表，表二取不到自己的列就写空字符串，
+            # 结果是「表二只剩城市名、指标全空」——看起来像填完了，实际把模板抹了。
             for tinfo in tables_info:
-                ti = tinfo["table_index"]
-                if ti < len(doc.tables):
-                    _write_docx_table(doc.tables[ti], tinfo["columns"], rows_data, tinfo.get("start_row", 1))
+                _write_one(tinfo, _rows_for_table(list(tinfo["columns"]), rows_data))
 
     doc.save(op)
     return op
@@ -995,6 +1310,48 @@ def _docx_row_fuzzy_get(row_dict: dict, col_name: str):
         if cn in kn or kn in cn:
             return v
     return ""
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"^(示例|样例|范例|example|demo|sample|占位|待填|待定|待补充|待完善|xx+|x{1,}|"
+    r"0(\.0+)?|[—\-/／]+|无|n/?a|\.\.\.|…)$",
+    re.IGNORECASE,
+)
+
+
+def _row_texts(table, ri: int) -> List[str]:
+    try:
+        return [c.text.strip() for c in table.rows[ri].cells]
+    except Exception:
+        return []
+
+
+def _row_is_placeholder(vals: List[str]) -> bool:
+    """整行都是空/占位内容 → 可以安全覆盖。"""
+    real = [v for v in vals if v]
+    if not real:
+        return True
+    return all(_PLACEHOLDER_RE.match(v) for v in real)
+
+
+def _first_writable_row(table, start_row: int) -> int:
+    """找出可以安全开始写入的行号。
+
+    规则：从 start_row 起，只有「全空行」或「占位行（示例/0/待填…）」才允许覆盖；
+    一旦遇到用户填过的真实内容，就整体改为追加到表末，绝不覆盖。
+    返回 len(table.rows) 表示追加。
+    """
+    n = len(table.rows)
+    idx = start_row
+    while idx < n:
+        if not _row_is_placeholder(_row_texts(table, idx)):
+            logger.info(
+                "[template_filler] 表内第 %s 行已有真实内容，改为在其后追加，不覆盖",
+                idx + 1,
+            )
+            return n
+        idx += 1
+    return start_row if start_row < n else n
 
 
 def _write_docx_table(table, columns: List[str], rows_data: List[Dict], start_row: int):
@@ -1028,6 +1385,15 @@ def _write_docx_table(table, columns: List[str], rows_data: List[Dict], start_ro
             val = _docx_row_fuzzy_get(row_dict, col_name)
             if val is None:
                 continue
+            # 单位以表头为准：带单位的值换算成表头声明单位
+            norm_val, unit_warn = normalize_cell(val, col_name)
+            if unit_warn:
+                _warn_unit_once(unit_warn, col_name)
+            if isinstance(norm_val, (int, float)) and not isinstance(norm_val, bool):
+                fval = float(norm_val)
+                val = str(int(fval)) if fval == int(fval) else f"{fval:g}"
+            else:
+                val = norm_val
             cell = row.cells[ci]
             # 清除已有段落内容但保留段落节点
             for p in cell.paragraphs:

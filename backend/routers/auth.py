@@ -1,3 +1,4 @@
+import os
 import hashlib
 import uuid
 import bcrypt
@@ -11,6 +12,9 @@ import jwt
 from database import get_db
 from models import User
 from config import SECRET_KEY, ACCESS_TOKEN_EXPIRE_MINUTES
+
+# 上传限额：避免一次性把大文件读进内存把进程打满
+_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 
 router = APIRouter(prefix="/api/auth", tags=["认证"])
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
@@ -44,10 +48,6 @@ def get_current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)
         u = db.query(User).filter(User.id == p.get("uid")).first()
         if not u:
             raise HTTPException(401, "用户不存在")
-        # 内测阶段：取消普通用户/管理员的权限区别，统一视为管理员
-        if u.role != "admin":
-            u.role = "admin"
-            db.commit()
         return u
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "登录过期")
@@ -62,10 +62,20 @@ class RegReq(BaseModel):
 
 @router.post("/register")
 def register(req: RegReq, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.username == req.username).first():
+    # 口令策略：此前这里对输入零校验，空口令也能注册成功并正常登录。
+    _uname = (req.username or "").strip()
+    _pwd = req.password or ""
+    if not _uname or len(_uname) > 64:
+        raise HTTPException(400, "账号名不能为空且不超过 64 字符")
+    if len(_pwd) < 8:
+        raise HTTPException(400, "口令至少 8 位")
+    # bcrypt 只取前 72 字节，超长口令会被静默截断，不如直接拒绝
+    if len(_pwd.encode("utf-8")) > 72:
+        raise HTTPException(400, "口令过长（超过 72 字节）")
+    if db.query(User).filter(User.username == _uname).first():
         raise HTTPException(400, "账号已存在")
-    # 内测阶段：所有新注册用户均默认为管理员角色
-    u = User(username=req.username, nickname=req.username, password=_hash_bcrypt(req.password), role="admin")
+    # 新注册用户一律为普通用户；管理员只能由已有管理员显式提升
+    u = User(username=_uname, nickname=_uname, password=_hash_bcrypt(_pwd), role="user")
     db.add(u)
     db.commit()
     db.refresh(u)
@@ -86,10 +96,6 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     if not u.password.startswith("$2b$"):
         u.password = _hash_bcrypt(form.password)
         db.commit()
-    # 内测阶段：取消角色区别，统一为管理员
-    if u.role != "admin":
-        u.role = "admin"
-        db.commit()
     t = _token({"uid": u.id, "username": u.username, "role": u.role})
     return {"access_token": t, "token_type": "bearer", "username": u.username, "nickname": u.nickname or u.username, "role": u.role, "avatar": u.avatar or ""}
 
@@ -106,7 +112,9 @@ async def upload_avatar(file: UploadFile = File(...), u: User = Depends(get_curr
         raise HTTPException(400, "仅支持 jpg/png/gif/webp 格式")
     name = f"{u.id}_{uuid.uuid4().hex[:8]}{ext}"
     path = AVATAR_DIR / name
-    content = await file.read()
+    content = await file.read(_MAX_UPLOAD_BYTES + 1)
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"文件超过 {_MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限")
     with open(path, "wb") as f:
         f.write(content)
     u.avatar = f"/api/auth/avatars/{name}"

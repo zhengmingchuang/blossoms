@@ -13,16 +13,20 @@ Coze 配置示例：
   插件 -> HTTP 请求:
     同上，POST 调用各接口
 """
+import secrets
 import uuid
 import time
+import os
+import logging
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, UploadFile, File, Header
 from pydantic import BaseModel
 from database import SessionLocal
-from models import FileInfo, DocChunk, ExtractResult, TaskInfo, User
-from config import UPLOAD_DIR, SECRET_KEY
+from models import FileInfo, DocChunk, ExtractResult, User
+from config import UPLOAD_DIR
 from services.document_parser import parse_document
+from services.archive_guard import assert_archive_safe, ArchiveRejected
 from services.vector_store import add_chunks, search as vs_search
 from services.extractor import hybrid_extract, rule_extract
 from services.fusion import fuse
@@ -30,19 +34,39 @@ from services.llm_service import call_llm_text
 
 router = APIRouter(prefix="/api/open", tags=["开放API"])
 
-WEBHOOK_KEY = "docfusion-webhook-2026"
+logger = logging.getLogger(__name__)
+
+# 开放接口密钥只从环境变量读取。未配置时整个 /api/open/* 关闭（503），
+# 不退回到源码里的默认值——仓库公开意味着默认值等于公开密钥。
+WEBHOOK_KEY = os.getenv("WEBHOOK_KEY", "").strip()
+if not WEBHOOK_KEY:
+    logger.warning("未配置 WEBHOOK_KEY，开放接口 /api/open/* 已禁用")
+
+MAX_OPEN_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 
 
 def _auth(api_key: Optional[str]):
+    if not WEBHOOK_KEY:
+        raise HTTPException(503, "开放接口未启用：请先配置环境变量 WEBHOOK_KEY")
     if not api_key:
         raise HTTPException(401, "缺少 X-API-Key")
-    if api_key not in (WEBHOOK_KEY, SECRET_KEY):
+    # 不再接受 SECRET_KEY：它是 JWT 签名密钥，一旦当 API Key 外发，
+    # 拿到的人可以直接伪造任意用户（含 admin）的登录令牌。
+    if not secrets.compare_digest(api_key, WEBHOOK_KEY):
         raise HTTPException(403, "API Key 无效")
 
 
 def _get_user(db):
-    u = db.query(User).first()
-    return u.id if u else 1
+    """开放接口的数据归属账号，由 OPEN_API_USER 显式指定（默认 admin）。
+
+    原实现固定取「第一个用户」，在单用户库上等于把全库数据暴露给任何持 key 者，
+    而且换了初始化顺序就会指向别人。
+    """
+    uname = (os.getenv("OPEN_API_USER", "admin") or "admin").strip()
+    u = db.query(User).filter(User.username == uname).first()
+    if not u:
+        raise HTTPException(503, f"开放接口归属账号 {uname} 不存在，请先创建或调整 OPEN_API_USER")
+    return u.id
 
 
 # ============ 文档上传+快速解析 ============
@@ -55,13 +79,26 @@ async def upload(file: UploadFile = File(...), x_api_key: Optional[str] = Header
     db = SessionLocal()
     try:
         t0 = time.time()
-        name = f"{uuid.uuid4().hex}_{file.filename}"
+        safe_name = os.path.basename(file.filename or "upload").replace("\\", "_")
+        name = f"{uuid.uuid4().hex}_{safe_name}"
         path = UPLOAD_DIR / name
-        content = await file.read()
+        content = await file.read(MAX_OPEN_UPLOAD + 1)
+        if len(content) > MAX_OPEN_UPLOAD:
+            raise HTTPException(413, f"文件超过 {MAX_OPEN_UPLOAD // 1024 // 1024}MB 上限")
         with open(path, "wb") as fp:
             fp.write(content)
+        # 解压炸弹闸门（parse_document 内部也有一次，这里是给开放接口的明确 4xx 反馈）
+        try:
+            assert_archive_safe(path, display_name=safe_name)
+        except ArchiveRejected as ae:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise HTTPException(413, str(ae))
         uid = _get_user(db)
-        fi = FileInfo(file_name=file.filename, file_type=ext.lstrip("."), file_path=str(path), file_size=len(content), upload_user=uid, parse_status="parsing")
+        # 入库名与盘上名同一口径：盘上已 basename，库里不能留原始 filename
+        fi = FileInfo(file_name=safe_name, file_type=ext.lstrip("."), file_path=str(path), file_size=len(content), upload_user=uid, parse_status="parsing")
         db.add(fi)
         db.commit()
         db.refresh(fi)
@@ -207,7 +244,7 @@ async def chat(req: ChatReq, x_api_key: Optional[str] = Header(None)):
     sys = "你是智能文档办公助手。根据文档内容回答问题。找不到信息如实告知。"
     msgs = []
     if ctx:
-        msgs.append({"role": "user", "content": f"参考文档：\n\n" + "\n\n---\n\n".join(ctx)})
+        msgs.append({"role": "user", "content": "参考文档：\n\n" + "\n\n---\n\n".join(ctx)})
         msgs.append({"role": "assistant", "content": "好的，我已了解文档内容。"})
     msgs.append({"role": "user", "content": req.message})
     answer = await call_llm_text(msgs, system=sys, temperature=0.3)
@@ -228,12 +265,13 @@ def list_files(x_api_key: Optional[str] = Header(None)):
 
 # ============ API 文档首页 ============
 @router.get("/")
-def api_info():
+def api_info(x_api_key: Optional[str] = Header(None)):
+    # 这个页面原先既不需要密钥、又把 webhook_key 明文回显——等于把钥匙挂在门上。
+    _auth(x_api_key)
     return {
         "system": "DocFusion 开放API",
         "version": "1.0",
         "auth": "Header: X-API-Key",
-        "webhook_key": WEBHOOK_KEY,
         "endpoints": {
             "POST /api/open/upload": "上传文档并快速解析（form-data: file）",
             "POST /api/open/extract": "LLM深度提取（JSON: {file_id, fields?}）",

@@ -1,9 +1,7 @@
 import json
 import re
 import logging
-from pathlib import Path
 from typing import List, Dict, Optional
-from collections import Counter
 from config import VECTOR_STORE_DIR
 
 logger = logging.getLogger(__name__)
@@ -109,30 +107,40 @@ def remove_file(file_id: int):
     _invalidate_token_cache()
 
 
-def search(query: str, top_k: int = 5, user_id: int = None) -> List[Dict]:
+def search(
+    query: str,
+    top_k: int = 5,
+    user_id: int = None,
+    file_ids: Optional[set] = None,
+) -> List[Dict]:
+    """向量/词频检索。
+
+    file_ids: 限定只在指定文件内检索。填表时用户勾选了数据源，LLM 兜底路径
+    必须带上这个限制，否则会把库里其它文档（历史上传、样例包）的内容也当成
+    数据源，造成结果污染。
+    """
     if not _chunks:
         return []
-    # 按 user_id 过滤
-    if user_id is not None:
-        pool = [c for c in _chunks if c.get("user_id") == user_id]
-    else:
-        pool = _chunks
-    if not pool:
+    # 语义检索此前是死代码：_ensure_embeddings() 全仓没有调用点，_embeddings 恒为 None，
+    # 于是即使装了 sentence-transformers 也永远走 TF-IDF，README 的描述与行为不符。
+    # 这里在每次检索前确保索引就绪；未装依赖时 _load_model 会把 _use_st 置 False，
+    # 只有首次尝试有开销，后续直接走 TF-IDF 降级，不会反复 import。
+    _ensure_embeddings()
+    allowed = set(file_ids) if file_ids is not None else None
+    indices = [
+        i
+        for i, c in enumerate(_chunks)
+        if (user_id is None or c.get("user_id") == user_id)
+        and (allowed is None or c.get("file_id") in allowed)
+    ]
+    if not indices:
         return []
-    if _embeddings is not None and np is not None:
-        # 需要找到 pool 中元素在 _chunks 中的原始索引
-        if user_id is not None:
-            indices = [i for i, c in enumerate(_chunks) if c.get("user_id") == user_id]
-            qe = _encode([query])[0]
-            scores = _embeddings @ qe
-            ranked = sorted(indices, key=lambda i: scores[i], reverse=True)[:top_k]
-            return [{"score": round(float(scores[i]), 4), **_chunks[i]} for i in ranked if scores[i] > 0.01]
-        else:
-            qe = _encode([query])[0]
-            scores = _embeddings @ qe
-            ranked = sorted(range(len(_chunks)), key=lambda i: scores[i], reverse=True)[:top_k]
-            return [{"score": round(float(scores[i]), 4), **_chunks[i]} for i in ranked if scores[i] > 0.01]
-    return _tfidf_search(query, top_k, user_id=user_id)
+    if _embeddings is not None and np is not None and len(_embeddings) == len(_chunks):
+        qe = _encode([query])[0]
+        scores = _embeddings @ qe
+        ranked = sorted(indices, key=lambda i: scores[i], reverse=True)[:top_k]
+        return [{"score": round(float(scores[i]), 4), **_chunks[i]} for i in ranked if scores[i] > 0.01]
+    return _tfidf_search(query, top_k, user_id=user_id, file_ids=allowed)
 
 
 _token_cache: Dict[int, set] = {}
@@ -149,14 +157,25 @@ def _invalidate_token_cache():
     _token_cache = {}
 
 
-def _tfidf_search(query: str, top_k: int, user_id: int = None) -> List[Dict]:
+def _tfidf_search(
+    query: str, top_k: int, user_id: int = None, file_ids: Optional[set] = None
+) -> List[Dict]:
     qt = set(_tokenize(query))
+
+    def _allowed(ch: Dict) -> bool:
+        if user_id is not None and ch.get("user_id") != user_id:
+            return False
+        # 空集合表示「不允许任何文件」，不能退化成「不限」
+        if file_ids is not None and ch.get("file_id") not in file_ids:
+            return False
+        return True
+
     if not qt:
-        pool = [c for c in _chunks if c.get("user_id") == user_id] if user_id is not None else _chunks
+        pool = [c for c in _chunks if _allowed(c)]
         return pool[:top_k]
     results = []
     for i, ch in enumerate(_chunks):
-        if user_id is not None and ch.get("user_id") != user_id:
+        if not _allowed(ch):
             continue
         ct = _get_chunk_tokens(i, ch.get("chunk_text", ""))
         common = qt & ct

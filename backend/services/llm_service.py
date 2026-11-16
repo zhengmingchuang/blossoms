@@ -8,16 +8,31 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # 全局共享 httpx 客户端，复用连接池，避免每次调用都重新建立 TCP/TLS 连接
 _shared_client: Optional[httpx.AsyncClient] = None
+# 记录创建该客户端时的事件循环。httpx 的连接池绑定在创建它的事件循环上，
+# 循环一换（测试里每个请求一个循环、或将来引入多 worker 线程）就会抛
+# 「Event loop is closed」，表现为「模型调用随机失败」。换循环时重建即可。
+_shared_client_loop: Any = None
 
 
 def _get_shared_client() -> httpx.AsyncClient:
-    global _shared_client
-    if _shared_client is None or _shared_client.is_closed:
+    global _shared_client, _shared_client_loop
+    try:
+        import asyncio as _asyncio
+
+        cur_loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        cur_loop = None
+    if (
+        _shared_client is None
+        or _shared_client.is_closed
+        or (cur_loop is not None and _shared_client_loop is not None and cur_loop is not _shared_client_loop)
+    ):
         _shared_client = httpx.AsyncClient(
             timeout=180,
             proxy=None,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
+        _shared_client_loop = cur_loop
     return _shared_client
 
 
@@ -246,10 +261,9 @@ async def _stream_openai(messages, system, temperature, max_tokens, tools=None):
                     msg["tool_calls"] = oai_tool_calls
                 msgs.append(msg)
             else:
-                oai_parts, has_tool_result = [], False
+                oai_parts = []
                 for b in content:
                     if b.get("type") == "tool_result":
-                        has_tool_result = True
                         msgs.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": b.get("content", "")})
                     elif b.get("type") == "image":
                         src = b.get("source", {})

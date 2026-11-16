@@ -6,11 +6,10 @@
 """
 import re
 import zipfile
-import shutil
 import os
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
@@ -264,8 +263,6 @@ def _build_cellimages_xml(
     for i, (img_id, media_path) in enumerate(needed.items(), 1):
         rid = f'rId{i}'
         rid_map[img_id] = rid
-        ext = Path(media_path).suffix.lower()
-
         pic_xmls.append(
             f'<etc:cellImage>'
             f'<xdr:pic>'
@@ -285,8 +282,6 @@ def _build_cellimages_xml(
             f'</etc:cellImage>'
         )
 
-        mime = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                '.bmp': 'image/bmp', '.gif': 'image/gif', '.webp': 'image/webp'}.get(ext, 'image/png')
         rel_entries.append(
             f'<Relationship Id="{rid}" '
             f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
@@ -377,7 +372,6 @@ def insert_images_openpyxl(
     try:
         from openpyxl import load_workbook
         from openpyxl.drawing.image import Image as XLImage
-        from openpyxl.utils import column_index_from_string
         import tempfile
 
         id_to_media = parse_dispimg_map(src_xlsx)
@@ -386,8 +380,6 @@ def insert_images_openpyxl(
 
         wb = load_workbook(dst_xlsx)
         ws = wb.active
-
-        col_idx = column_index_from_string(col_letter)  # 1-based
 
         with zipfile.ZipFile(src_xlsx, 'r') as src_z:
             for item in cell_images:

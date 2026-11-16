@@ -1,5 +1,4 @@
-import hashlib
-from typing import Optional, List
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -36,8 +35,23 @@ def _set(db, key, val):
     db.commit()
 
 
+def _require_admin(user: User):
+    """配置与用户管理只允许管理员操作。
+
+    此前这些接口只校验「已登录」，任何普通用户都能：
+      - 改 LLM 网关地址，把 api_key 引向自己的服务器（SSRF + 密钥外带）；
+      - 重置包括 admin 在内的任意账号口令（直接接管）；
+      - 删除任意账号。
+    """
+    if (user.role or "") != "admin":
+        raise HTTPException(403, "需要管理员权限")
+
+
 @router.get("/config")
 def get_config(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # 读配置同样收口：它暴露 LLM 网关地址与「是否已配置密钥」，
+    # 把「该往哪改」这个攻击面留给所有人没有意义。
+    _require_admin(user)
     return {
         "llm_api_base": _get(db, "llm_api_base") or cfg.LLM_API_BASE,
         "llm_model": _get(db, "llm_model") or cfg.LLM_MODEL,
@@ -50,6 +64,7 @@ def get_config(db: Session = Depends(get_db), user: User = Depends(get_current_u
 
 @router.put("/config")
 def set_config(req: CfgReq, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
     if req.llm_api_base is not None:
         _set(db, "llm_api_base", req.llm_api_base); cfg.LLM_API_BASE = req.llm_api_base
     if req.llm_api_key is not None:
@@ -83,19 +98,23 @@ class UserUpdateReq(BaseModel):
 
 @router.put("/users/{uid}")
 def update_user(uid: int, req: UserUpdateReq, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
     target = db.query(User).filter(User.id == uid).first()
     if not target:
         raise HTTPException(404)
     if req.role:
         target.role = req.role
     if req.password:
-        target.password = hashlib.sha256(req.password.encode()).hexdigest()
+        # 必须与 auth._hash_bcrypt 一致：无盐 SHA256 等于把所有口令放进彩虹表
+        from routers.auth import _hash_bcrypt
+        target.password = _hash_bcrypt(req.password)
     db.commit()
     return {"message": "已更新"}
 
 
 @router.delete("/users/{uid}")
 def delete_user(uid: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
     if uid == user.id:
         raise HTTPException(400, "不能删除自己")
     target = db.query(User).filter(User.id == uid).first()

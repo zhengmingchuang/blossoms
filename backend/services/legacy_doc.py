@@ -105,7 +105,7 @@ def convert_doc_to_docx_temp(doc_path: str) -> Optional[str]:
             if out.is_file() and out.stat().st_size > 0:
                 fd, dest = tempfile.mkstemp(suffix=".docx")
                 os.close(fd)
-                shutil.move(str(out), dest)
+                os.replace(str(out), dest)
                 shutil.rmtree(outdir, ignore_errors=True)
                 return dest
         shutil.rmtree(outdir, ignore_errors=True)

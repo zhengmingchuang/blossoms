@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +19,36 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     force=True,
 )
+
+
+def _fix_mimetypes():
+    """Windows 上 .js/.mjs 可能被注册表映射成 text/plain，导致浏览器拒绝执行 module script（表现为白屏）。
+
+    Python 的 mimetypes 在 Windows 下会读注册表 HKCR\\.js\\Content Type，
+    部分机器上该键被写成 text/plain。浏览器对 <script type="module"> 强制校验 MIME，
+    于是 index.html 正常返回、JS 全部加载失败，页面只剩空白。
+    这里在进程启动时把前端用到的类型显式钉死，不依赖操作系统注册表。
+    """
+    forced = {
+        ".js": "text/javascript",
+        ".mjs": "text/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".map": "application/json",
+        ".svg": "image/svg+xml",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+        ".ttf": "font/ttf",
+        ".ico": "image/x-icon",
+    }
+    for ext, mime in forced.items():
+        mimetypes.add_type(mime, ext)
+    bad = [ext for ext, mime in forced.items() if mimetypes.guess_type("x" + ext)[0] != mime]
+    if bad:
+        logging.getLogger("main").warning("MIME 类型修正失败: %s", ", ".join(bad))
+
+
+_fix_mimetypes()
 
 
 def _ensure_app_loggers_to_stderr():
@@ -59,23 +90,83 @@ try:
 except Exception:
     pass
 
-# 自动创建 admin 账号（如果不存在）
+# 自动创建 admin 账号（仅当不存在时）
+# 安全约束：
+#   1. 初始口令只从 ADMIN_INIT_PASSWORD 读取，源码与文档都不留明文默认值；
+#   2. 未配置时生成一次性随机口令并落盘到仅本机可读文件，日志只给路径、不打印口令
+#      —— 日志会被采集/转发，打印明文等同于公开管理员口令；
+#   3. 不在启动时批量改角色，角色变更只走显式管理操作。
 try:
     from models import User
     from routers.auth import _hash_bcrypt
     _init_db = SessionLocal()
     if not _init_db.query(User).filter(User.username == "admin").first():
-        _init_db.add(User(username="admin", nickname="admin", password=_hash_bcrypt("admin123"), role="admin"))
+        _init_pwd = os.getenv("ADMIN_INIT_PASSWORD", "").strip()
+        _generated = False
+        if not _init_pwd:
+            import secrets as _secrets
+            _init_pwd = _secrets.token_urlsafe(18)
+            _generated = True
+        _init_db.add(User(username="admin", nickname="admin",
+                          password=_hash_bcrypt(_init_pwd), role="admin"))
         _init_db.commit()
-        logging.getLogger("main").info("已自动创建 admin 账号 (用户名: admin, 密码: admin123)")
-    # 内测阶段：取消普通用户/管理员的权限区别，统一全部用户为管理员
-    _upgraded = _init_db.query(User).filter(User.role != "admin").update({"role": "admin"}, synchronize_session=False)
-    if _upgraded:
-        _init_db.commit()
-        logging.getLogger("main").info(f"内测阶段：已将 {_upgraded} 个普通用户统一升级为管理员")
+        if _generated:
+            _pwd_file = cfg.BASE_DIR / ".admin_initial_password"
+            try:
+                _pwd_file.write_text(_init_pwd, encoding="utf-8")
+                try:
+                    os.chmod(_pwd_file, 0o600)
+                except OSError:
+                    pass
+                logging.getLogger("main").warning(
+                    "已创建 admin 账号，初始口令写入 %s（首次登录后请立即修改并删除该文件）", _pwd_file)
+            except Exception:
+                logging.getLogger("main").warning(
+                    "已创建 admin 账号，但初始口令落盘失败；请设置 ADMIN_INIT_PASSWORD 后重置该账号")
+        else:
+            logging.getLogger("main").info("已创建 admin 账号，初始口令来自 ADMIN_INIT_PASSWORD")
     _init_db.close()
 except Exception as _init_err:
     logging.getLogger("main").error(f"自动创建 admin 账号失败: {_init_err}")
+
+def _recover_stale_tasks():
+    """把上次进程遗留的 running/pending 任务标成失败。
+
+    任务状态存在数据库里，但执行它的 asyncio 任务只在内存里。进程一重启（部署、
+    崩溃、被 OOM 杀掉），库里那些行就永远停在 running：用户在任务列表看到的是
+    一个永远「进行中」的任务，既不能重试也不会报错。
+
+    启动时没有任何任务在跑，所以此时所有 running/pending 都是遗留行——可以直接判定。
+    **前提**：单进程部署（本项目的运行方式）。若将来改成多 worker / 多实例，
+    这里必须先确认「本实例启动时没有其它实例正在跑任务」，否则会把别人在跑的任务标死。
+    """
+    from models import TaskInfo
+    from datetime import datetime
+    db = SessionLocal()
+    try:
+        rows = db.query(TaskInfo).filter(TaskInfo.status.in_(("running", "pending"))).all()
+        if not rows:
+            return
+        now = datetime.now()
+        for t in rows:
+            t.status = "error"
+            t.end_time = now
+            if t.start_time:
+                try:
+                    t.elapsed = round(max(0.0, (now - t.start_time).total_seconds()), 2)
+                except Exception:
+                    pass
+            t.result_summary = "服务重启导致任务中断，请重新发起"
+        db.commit()
+        logging.getLogger("main").warning(
+            "已把 %d 个上次进程遗留的「进行中」任务标记为失败（服务重启，任务状态无法恢复）",
+            len(rows),
+        )
+    except Exception as e:
+        logging.getLogger("main").error(f"回收遗留任务状态失败: {e}")
+    finally:
+        db.close()
+
 
 def load_saved_config():
     db = SessionLocal()
@@ -114,12 +205,31 @@ def load_saved_config():
 async def lifespan(_: FastAPI):
     _ensure_app_loggers_to_stderr()
     load_saved_config()
+    # 必须在开始接受请求之前：否则用户先看到「进行中」，再被改成失败，体验更差
+    _recover_stale_tasks()
     yield
 
 
 app = FastAPI(title="DocFusion - 文档理解与多源数据融合系统", version="1.0.0", lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# CORS：默认只放行本地开发端口；部署时用 CORS_ORIGINS 覆盖（逗号分隔）。
+# 不能同时用 allow_origins=["*"] 与 allow_credentials=True —— 浏览器会拒绝带凭据的跨域请求，
+# 且等于把接口暴露给任意站点。
+_cors_env = os.getenv("CORS_ORIGINS", "").strip()
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = [
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+    ]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(auth.router)
 app.include_router(documents.router)

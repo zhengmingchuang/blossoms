@@ -4,7 +4,7 @@ import re
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -192,6 +192,36 @@ def _read_openpyxl_row_header_labels(ws, row_1based: int) -> List[str]:
     return labels
 
 
+# 纯数值 / 日期形态：用于区分「表头的标签」和「数据行的值」
+_VALUE_LIKE_RE = re.compile(
+    r"^[+-]?\d[\d,]*(?:\.\d+)?\s*%?$"          # 1234 / 12.5 / 1,234 / 30%
+    r"|^\d{4}\s*[-/年]\s*\d{1,2}"                 # 2024-07 / 2024年7月
+    r"|^\d{4}\s*年?$"                               # 2024 / 2024年
+)
+
+
+def _looks_like_value(s: str) -> bool:
+    return bool(_VALUE_LIKE_RE.match(str(s).strip()))
+
+
+def _is_plausible_header_row(labels, min_labels: int = 3) -> bool:
+    """判断某一行像不像表头。
+
+    原实现硬要求「非空标签 ≥ 3」，副作用是「城市 / GDP」这类两列表格
+    永远进不了结构化路径，只能退回 LLM 兜底（慢、按次计费、结果不稳定）。
+
+    这里换成更本质的判据——表头由「标签」构成，数据行至少有一个「值」：
+      - 非空 ≥ 3：直接通过（保持原行为，零回归）；
+      - 非空 == 2：两个单元格都不能是纯数值/日期，排除「上海 / 52000」这类数据行。
+    """
+    nonempty = [str(x).strip() for x in (labels or []) if x is not None and str(x).strip()]
+    if len(nonempty) >= min_labels:
+        return True
+    if len(nonempty) == 2 and not any(_looks_like_value(x) for x in nonempty):
+        return True
+    return False
+
+
 def _enumerate_xlsx_header_candidate_rows(fp: str, sheet_name: str, max_scan: int = 30) -> List[Tuple[int, List[str]]]:
     """列出工作表前 max_scan 行中可作为表头的候选 (行号1-based, 标签列表)。"""
     out: List[Tuple[int, List[str]]] = []
@@ -206,7 +236,7 @@ def _enumerate_xlsx_header_candidate_rows(fp: str, sheet_name: str, max_scan: in
             last = min(max_scan, mr)
         for ri in range(1, last + 1):
             labels = _read_openpyxl_row_header_labels(ws, ri)
-            if sum(1 for x in labels if x) >= 3:
+            if _is_plausible_header_row(labels):
                 out.append((ri, labels))
     finally:
         wb.close()
@@ -224,7 +254,7 @@ def _enumerate_xls_header_candidate_rows(file_path: str, sheet_name: str, max_sc
     for ri in range(last):
         row = list(sheet.row_values(ri))
         labels = _matrix_row_to_header_labels(row)
-        if sum(1 for x in labels if x) >= 3:
+        if _is_plausible_header_row(labels):
             out.append((ri + 1, labels))
     return out
 
@@ -682,13 +712,54 @@ _NARRATIVE_REGION_NOISE_SUBSTR = (
 def _filter_plausible_region_tokens(candidates: List[str]) -> List[str]:
     """去掉从模板说明/叙事文本里误扫出的地名碎片。"""
     out: List[str] = []
+    expanded: List[str] = []
     for raw in candidates:
+        # 「济南市和青岛市」会被正则整段吞成一个 token，匹配不到任何城市，
+        # 城市条件等于失效（回退后变成「不过滤」）。在行政区后缀后接连接词处切开。
+        parts = re.split(
+            r"(?<=[省市县区])(?:和|与|及|、)(?=[\u4e00-\u9fff]{2,6}(?:市|省|区|县|自治区))",
+            str(raw or ""),
+        )
+        expanded.extend(p.strip() for p in parts if p.strip())
+    for raw in expanded:
         s = (raw or "").strip()
         if not s or len(s) > 24:
             continue
+        # 「2024年山东省的数据」会被正则吞成「年山东省」：年份的「年」粘在了地名前面。
+        # 只在去掉首字后仍以行政区后缀结尾时才剥，避免误伤「日照市」这类真地名。
+        if s.startswith("年") and s[1:].endswith(("省", "市", "区", "县", "自治区", "特别行政区")):
+            s = s[1:]
+        # 「只填拉萨市」「筛选杭州市」这类动词前缀会被正则一起吞进来（「只填拉萨」+「市」），
+        # 结果是城市条件永远匹配不到任何行。剥掉常见动词前缀，只留地名。
+        for _vp in (
+            "只保留", "只填", "只取", "只要", "筛选", "查询", "统计", "导出",
+            "显示", "列出", "查看", "包含", "关于", "位于", "填入", "填写",
+        ):
+            if s.startswith(_vp) and len(s) > len(_vp) + 1:
+                s = s[len(_vp):]
+                break
         if any(b in s for b in _NARRATIVE_REGION_NOISE_SUBSTR):
             continue
+        # 「中国城市」「全国城市」这类是泛称，不是地名；「城市」两个字单独出现同样不是。
+        # 不能用「包含城市」判断——「聊城市」是真地名，会被误杀。
+        if s.endswith("城市") and (
+            not s[:-2]
+            or s[:-2]
+            in (
+                "中国", "全国", "各", "本", "该", "省内", "地市", "省市", "全域",
+                "所有", "全部", "部分", "各个", "华东", "华南", "华北", "华中", "西部", "东部",
+            )
+        ):
+            continue
+        if s in ("都市", "全市", "本市", "各市", "地市", "省市", "城区", "市区"):
+            continue
         if s in ("行政区", "涵盖城市", "部分城市", "监测数据"):
+            continue
+        # 数值/单位片段（如「万亿的城市」「亿元」）不是地名
+        if re.search(r"[\d]", s) or re.search(r"(万亿|千亿|百亿|亿元|万元|千万|百万)", s):
+            continue
+        # 「万的城市」「人口低于」这类比较句碎片不是地名
+        if "的" in s or re.search(r"(大于|小于|低于|高于|超过|不少于|不低于|以上|以下)", s):
             continue
         # 「XX市」极长多为整句误吞；正常地级市多 ≤9 字（含「市」）
         if s.endswith("市") and len(s) > 9:
@@ -742,15 +813,304 @@ def _extract_prefecture_cities_from_narrative(req: str) -> List[str]:
     return _filter_plausible_region_tokens(list(dict.fromkeys(hits)))
 
 
+_NUM_CMP_RE = re.compile(
+    r"(?P<op>大于等于|不低于|不少于|不小于|超过|大于|高于|多于"
+    r"|小于等于|不高于|不超过|不大于|低于|小于|少于"
+    r"|>=|<=|≥|≤|>|<|＞|＜)"
+    r"\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>万亿|千亿|百亿|十亿|千万|百万|亿|万|千)?"
+)
+
+_NUM_UNIT_SCALE = {
+    "万亿": 1e12, "千亿": 1e11, "百亿": 1e10, "十亿": 1e9,
+    "千万": 1e7, "百万": 1e6, "亿": 1e8, "万": 1e4, "千": 1e3, "": 1.0,
+}
+
+# 后置式比较：「5万亿以上」「1000万以下」。必须带数量级，避免「100以上」这类
+# 纯计数被误当量纲条件。
+_NUM_SUFFIX_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>万亿|千亿|百亿|十亿|千万|百万|亿|万|千)\s*"
+    r"(?P<sfx>及以上|及以下|以上|以下)"
+)
+
+# 关键字前面常见的动词/虚词，取列名关键词时要剥掉
+# 引导语/动作词：用户口述条件时常带「填写/帮我填/把…填进去」，
+# 这些词不是列名的一部分，必须在取关键字时剥掉，
+# 否则「填写GDP超过5万亿」会得到 keyword=填写GDP，匹配不到「GDP总量（亿元）」，
+# 条件被静默丢弃，最终返回全表（用户看到的「乱切」）。
+_KW_LEAD_RE = re.compile(
+    r"^(?:请帮我|麻烦帮我|帮我|帮忙|请|麻烦|然后|接着|再|并|把|将|对|按|按照|根据|就|在|从"
+    r"|填写|填入|填充|填上|补全|补齐|完善|填|录入|写入|输入"
+    r"|保留|过滤|提取|抽取|筛选|查询|统计|导出|输出|列出|列举|找出|选出|挑出|给出|显示|查看|展示|整理|汇总|生成"
+    r"|只要|仅要|只需要|需要|所有|全部|其中|只|仅|的|是|为|有|含|包含)+"
+)
+
+
+def _norm_col_text(s: str) -> str:
+    """列名/关键词归一化：小写、去括号单位、去标点空白。"""
+    t = str(s or "").lower()
+    t = re.sub(r"[（(][^）)]*[）)]", "", t)
+    t = re.sub(r"[\s_\-/、，,：:（）()]", "", t)
+    return t
+
+
+def _parse_numeric_filters(req: str) -> List[Dict[str, Any]]:
+    """解析数值比较条件，如「GDP总量大于5万亿」「人口低于1000万」。
+
+    返回 [{"keyword": "gdp总量", "op": ">", "value": 5.0, "unit": "万亿", "base_value": 5e12}]
+    base_value 已换算到基本单位（元/人/…），由调用方按列头单位二次换算。
+    """
+    out: List[Dict[str, Any]] = []
+    for m, op, unit in _iter_numeric_matches(req):
+        try:
+            num = float(m.group("num"))
+        except ValueError:
+            continue
+        # 关键字：运算符前最近的词，最多回看 20 个字符。
+        # 多个条件并列（「GDP大于5万亿且人口低于2000万」）时，只取连接词之后的那一段；
+        # 否则第二个条件的 keyword 会变成「GDP大于5万亿且人口」，匹配不到任何列，
+        # 条件被静默丢弃——用户以为筛过了，其实一行没筛。
+        ctx = req[max(0, m.start() - 20): m.start()].strip()
+        ctx = re.split(r"[，,。；;、\s]|并且|同时|以及|而且|且", ctx)[-1] if ctx else ""
+        # 没有连接词时（「…5万亿人口低于…」）剥掉开头的残留数值
+        ctx = re.sub(r"^\d+(?:\.\d+)?\s*(?:万亿|千亿|百亿|十亿|千万|百万|亿|万|千)?", "", ctx).strip()
+        ctx = _KW_LEAD_RE.sub("", ctx).strip()
+        # 去掉结尾的「要/是/在」等残留，以及「GDP大于5万亿以上」这类重复表述留下的运算符
+        ctx = re.sub(r"[要是为在的了]+$", "", ctx).strip()
+        ctx = re.sub(
+            r"(?:大于等于|不低于|不少于|不小于|超过|大于|高于|多于"
+            r"|小于等于|不高于|不超过|不大于|低于|小于|少于)+$",
+            "", ctx,
+        ).strip()
+        if not ctx:
+            continue
+        out.append({
+            "keyword": ctx,
+            "op": op,
+            "value": num,
+            "unit": unit,
+            # 用户到底有没有说数量级，决定了阈值怎么换算：
+            # 说了「5 万亿」→ 5e12 基本单位；只说「50000」→ 就是列头单位下的 50000。
+            # 两者混为一谈会把「GDP 超过 50000」换算成 0.0005 亿元，条件形同虚设。
+            "has_unit": bool(unit),
+            "base_value": num * _NUM_UNIT_SCALE.get(unit, 1.0),
+        })
+    # 同一个关键字只保留最后一个条件，避免重复
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for f in out:
+        dedup[f["keyword"]] = f
+    return list(dedup.values())
+
+
+def _iter_numeric_matches(req: str):
+    """产出 (match, 归一化运算符, 单位)：兼容「大于5万亿」与「5万亿以上」两种说法。"""
+    op_map = {
+        "大于等于": ">=", "不低于": ">=", "不少于": ">=", "不小于": ">=",
+        "超过": ">", "大于": ">", "高于": ">", "多于": ">",
+        "小于等于": "<=", "不高于": "<=", "不超过": "<=", "不大于": "<=",
+        "低于": "<", "小于": "<", "少于": "<",
+        "＞": ">", "＜": "<", "≥": ">=", "≤": "<=",
+    }
+    for m in _NUM_CMP_RE.finditer(req):
+        yield m, op_map.get(m.group("op"), m.group("op")), (m.group("unit") or "")
+    for m in _NUM_SUFFIX_RE.finditer(req):
+        # 「大于5万亿以上」这类重复表述以前置运算符为准，避免同一条件产生两条
+        head = req[max(0, m.start() - 8): m.start()]
+        if _NUM_CMP_RE.search(head):
+            continue
+        op = ">=" if m.group("sfx") in ("以上", "及以上") else "<="
+        yield m, op, (m.group("unit") or "")
+
+
+# 列名里常见的量纲后缀，去掉后剩下的才是「指标主体」（GDP总量 → GDP）。
+_COL_SUFFIX_RE = re.compile(
+    r"(?:总量|总额|合计|总计|小计|总值|数量|数目|金额|数值|数据|指标|情况|水平|规模|收入|支出)$"
+)
+
+
+def _col_core_forms(nc: str) -> List[str]:
+    """列名归一化后的候选指代形式：原样 + 去掉量纲后缀的主体。"""
+    forms = [nc]
+    core = _COL_SUFFIX_RE.sub("", nc)
+    if core and core != nc and len(core) >= 2:
+        forms.append(core)
+    return forms
+
+
+def _match_filter_column(keyword: str, col_names: List[str]) -> Optional[str]:
+    """把「gdp总量」这类关键词匹配到模板列名（如「GDP总量（亿元）」）。
+
+    用户口述往往裹着动作词（「填写GDP超过5万亿」），即使剥过引导词，
+    关键字仍可能带残留，所以除了精确/双向包含，还补两级兜底：
+    列名主体出现在关键字里（GDP ⊂ 填写GDP），以及逐字剥掉关键字前缀。
+    """
+    kw = _norm_col_text(keyword)
+    if not kw:
+        return None
+    norm = [(_norm_col_text(c), c) for c in col_names if c]
+    # 1) 完全一致
+    for nc, c in norm:
+        if nc == kw:
+            return c
+    # 2) 双向包含：关键词 ⊂ 列名，或列名 ⊂ 关键词
+    for nc, c in norm:
+        if kw in nc or (len(nc) >= 2 and nc in kw):
+            return c
+    # 3) 列名主体出现在关键词里：kw=填写gdp、nc=gdp总量 → 取最长主体，避免 gdp 误撞人均gdp
+    best: Optional[Tuple[int, str]] = None
+    for nc, c in norm:
+        for form in _col_core_forms(nc):
+            if len(form) >= 2 and form in kw:
+                if best is None or len(form) > best[0]:
+                    best = (len(form), c)
+    if best:
+        return best[1]
+    # 4) 逐字剥掉关键词前缀再试：填写gdp → 写gdp → gdp
+    for i in range(1, len(kw) - 1):
+        tail = kw[i:]
+        if len(tail) < 2:
+            break
+        for nc, c in norm:
+            if tail == nc or tail in nc:
+                return c
+    return None
+
+
+def usable_numeric_filters(
+    numeric_filters: List[Dict[str, Any]], col_names: List[str]
+) -> List[Dict[str, Any]]:
+    """只保留能落到模板列上的数值条件。
+
+    正则难免误命中（如「增速>5%」里的 `>`），若把这种无法匹配列的条件也当成
+    「用户给了数值条件」，上层会据此跳过补漏，最终行数变少且没有任何提示。
+    这里先做一次可落地性校验，全部匹配不上就当没解析到条件。
+    """
+    if not numeric_filters or not col_names:
+        return []
+    return [f for f in numeric_filters if _match_filter_column(f.get("keyword", ""), col_names)]
+
+
+def apply_numeric_filters(
+    rows: List[Dict[str, Any]],
+    col_names: List[str],
+    numeric_filters: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """按「GDP 大于 5 万亿」这类数值条件过滤行。
+
+    单位换算以模板列头为准：条件里的 5 万亿先换算到基本单位（元），
+    再除以列头单位倍率（亿元 → 1e8），得到 50000，与单元格数值直接比较。
+    表头没写单位时按用户口述单位比较，并在说明里提示口径不确定。
+
+    返回 (保留的行, 说明日志)。
+    """
+    from services.unit_normalize import normalize_cell, parse_header_unit, parse_value_with_unit, split_unit
+
+    notes: List[str] = []
+    if not numeric_filters or not rows:
+        return rows, notes
+
+    checks = []
+    for f in numeric_filters:
+        col = _match_filter_column(f.get("keyword", ""), col_names)
+        if not col:
+            notes.append(f"数值条件「{f.get('keyword')} {f.get('op')} {f.get('value')}{f.get('unit','')}」未匹配到列，已跳过")
+            continue
+        col_unit = parse_header_unit(col)
+        _, col_scale = split_unit(col_unit) if col_unit else (None, None)
+        # has_unit=False 表示用户只给了数字没给数量级（「GDP 超过 50000」），
+        # 此时应按列头单位理解，而不是当成基本单位再除以倍率——
+        # 否则 50000 会变成 0.0005 亿元，任何一行都满足，筛选等于没做。
+        if col_scale and f.get("has_unit", True):
+            threshold = f["base_value"] / col_scale
+            notes.append(
+                f"数值条件生效: {col} {f['op']} {round(threshold, 4)}（列头单位 {col_unit}，"
+                f"原条件 {f['value']}{f.get('unit','')}）"
+            )
+        elif col_scale:
+            threshold = f["value"]
+            notes.append(
+                f"数值条件生效: {col} {f['op']} {threshold}（用户未给数量级，按列头单位 {col_unit} 理解）"
+            )
+        else:
+            threshold = f["value"]
+            notes.append(
+                f"数值条件生效: {col} {f['op']} {threshold}（列头无单位，按用户口述单位比较，口径可能不符）"
+            )
+        checks.append((col, f["op"], threshold))
+
+    if not checks:
+        return rows, notes
+
+    ops = {
+        ">": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+    }
+
+    def _cell_number(row: Dict[str, Any], col: str) -> Optional[float]:
+        # 单元格自带单位（如「5.2万亿」）必须先按列头单位换算，否则
+        # 5.2 与 50000 直接比大小，会把本来符合条件的高值行整行丢掉。
+        norm_val, _warn = normalize_cell(row.get(col), col)
+        if isinstance(norm_val, (int, float)) and not isinstance(norm_val, bool):
+            return float(norm_val)
+        num, _unit = parse_value_with_unit(row.get(col))
+        return num
+
+    # 该列一整列都解析不出数值时（多表模板里某张表没有这一列），
+    # 条件一律不成立会把整张表清空，比不筛选更糟——直接跳过这条条件。
+    valid_checks = []
+    for col, op, threshold in checks:
+        if any(_cell_number(r, col) is not None for r in rows):
+            valid_checks.append((col, op, threshold))
+        else:
+            notes.append(f"数值条件跳过: 列「{col}」在数据中没有可解析的数值")
+    if not valid_checks:
+        return rows, notes
+    checks = valid_checks
+
+    kept: List[Dict[str, Any]] = []
+    dropped_unparsable = 0
+    for row in rows:
+        ok = True
+        for col, op, threshold in checks:
+            num = _cell_number(row, col)
+            if num is None:
+                dropped_unparsable += 1
+                ok = False
+                break
+            if not ops.get(op, lambda a, b: True)(num, threshold):
+                ok = False
+                break
+        if ok:
+            kept.append(row)
+
+    removed = len(rows) - len(kept)
+    notes.append(
+        f"数值条件过滤: {len(rows)} 行 → {len(kept)} 行（剔除 {removed} 行"
+        + (f"，其中 {dropped_unparsable} 行数值无法解析" if dropped_unparsable else "")
+        + "）"
+    )
+    return kept, notes
+
+
 def parse_filter_conditions(user_requirement: str) -> Dict[str, Any]:
     """从用户要求中解析筛选条件（规则方式，不调LLM）"""
     conditions = {}
     req = str(user_requirement or "").strip()
     if not req:
         return conditions
+
+    # 数值比较条件：「GDP总量大于5万亿」「人口低于1000万」
+    numeric_filters = _parse_numeric_filters(req)
+    if numeric_filters:
+        conditions["numeric_filters"] = numeric_filters
+
     
-    # 日期范围: "从2020/7/1到2020/8/31" 或 "2025-11-25"
-    date_range = re.findall(r'从\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*到\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})', req)
+    # 日期范围: "从2020/7/1到2020/8/31" / "2020-07-01至2020-08-31" / "2020/7/1~2020/8/31"
+    date_range = re.findall(
+        r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*(?:到|至|~|～|—|－)\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+        req,
+    )
     if date_range:
         conditions["date_range"] = {"start": date_range[0][0], "end": date_range[0][1]}
     
@@ -783,8 +1143,13 @@ def parse_filter_conditions(user_requirement: str) -> Dict[str, Any]:
     if merged_regions:
         conditions["cities"] = merged_regions
 
-    # 年份解析
-    years = re.findall(r'((?:19|20)\d{2})\s*年?', req)
+    # 年份解析。
+    # 不能见「19/20 开头的四位数」就当成年份：「人口低于2000万」里的 2000 是数量，
+    # 被识别成年份后，年份筛选会把整批数据清空。数量级后缀紧随时一律不算年份。
+    years = re.findall(
+        r'((?:19|20)\d{2})(?!\s*(?:万亿|千亿|百亿|十亿|千万|百万|亿|万|千))',
+        req,
+    )
     if years:
         conditions["years"] = list(dict.fromkeys(years))
 
@@ -842,7 +1207,8 @@ async def parse_filter_with_llm(user_requirement: str, template_columns: List[st
     "date_range": {"start": "2020-07-01", "end": "2020-08-31", "column": "日期"},  // 可选
     "exact_match": {"列名": "值", ...},  // 可选，精确匹配条件
     "datetime_exact": "2025-11-25 09:00:00.0",  // 可选，精确时间匹配
-    "datetime_column": "监测时间"  // 可选，时间列名
+    "datetime_column": "监测时间",  // 可选，时间列名
+    "numeric_filters": [{"column": "GDP总量", "op": ">", "value": 5, "unit": "万亿"}]  // 可选，数值比较
   },
   "column_mapping": {"模板列名": "数据源列名", ...},
   "group_by": "某列名"  // 可选，按该列分组（如多城市场景填城市列名；省级场景填省级列名）
@@ -857,6 +1223,14 @@ async def parse_filter_with_llm(user_requirement: str, template_columns: List[st
 6. year_exact 如果可识别年份，给出四位年份字符串，如 "2023"
 7. 行政级别：若模板列名含「省」「自治区」「特别行政区」等省级含义，column_mapping 中该模板列不得映射到数据源里仅表示「城市」「地级市」「city」的列（除非用户明确要求按城市填省级列）。若模板列明确表示城市，则可映射到城市列。
 8. 禁止输出任何 markdown、注释或解释性文本，只能输出一个 JSON 对象
+
+numeric_filters 规则（用户说了「超过/大于/不低于/低于/不超过…某个数量」时使用）：
+- column：模板列名，或用户口述的指标名（如「GDP」「人口」「人均GDP」）
+- op：只能是 > >= < <= 之一
+- value：纯数字（中文数字要转成阿拉伯数字，「五万亿」→ 5）
+- unit：只能是 万亿/千亿/百亿/十亿/千万/百万/亿/万/千 之一；用户没说数量级时给空字符串 ""
+- 用户没有提出任何数值比较条件时，numeric_filters 给空数组 []
+- 不要把「同比增长 5%」「排名前 10」这类当成 numeric_filters
 
 只返回JSON，不要解释。"""
     
@@ -904,11 +1278,118 @@ async def parse_filter_with_llm(user_requirement: str, template_columns: List[st
                     continue
                 safe_mapping[k] = v
 
+    # 数值比较条件：LLM 的输出不可直接信任，必须逐项校验（运算符白名单、数值可解析、
+    # 单位在白名单内），否则一个幻觉出来的阈值会把整张表筛空。
+    if isinstance(filters.get("numeric_filters"), list):
+        filters["numeric_filters"] = _normalize_llm_numeric_filters(filters["numeric_filters"])
+    else:
+        filters.pop("numeric_filters", None)
+
     return {
         "filters": filters,
         "column_mapping": safe_mapping,
         "group_by": group_by,
     }
+
+
+_LLM_OP_MAP = {
+    "大于": ">", "超过": ">", "高于": ">", "多于": ">", ">": ">", "＞": ">",
+    "大于等于": ">=", "不低于": ">=", "不少于": ">=", "不小于": ">=", ">=": ">=", "≥": ">=",
+    "小于": "<", "低于": "<", "少于": "<", "<": "<", "＜": "<",
+    "小于等于": "<=", "不高于": "<=", "不超过": "<=", "不大于": "<=", "<=": "<=", "≤": "<=",
+}
+
+
+def _normalize_llm_numeric_filters(raw: Any) -> List[Dict[str, Any]]:
+    """把 LLM 返回的 numeric_filters 归一化成与规则解析一致的结构。
+
+    校验不放宽：运算符必须在白名单内、value 必须能转成有限浮点、
+    unit 必须在数量级白名单内（不在就当作「无数量级」，而不是猜一个）。
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        col = str(item.get("column") or item.get("keyword") or "").strip()
+        op = _LLM_OP_MAP.get(str(item.get("op") or "").strip())
+        try:
+            val = float(item.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if not col or not op or val != val or val in (float("inf"), float("-inf")):
+            continue
+        unit = str(item.get("unit") or "").strip()
+        if unit not in _NUM_UNIT_SCALE:
+            unit = ""
+        out.append({
+            "keyword": col,
+            "op": op,
+            "value": val,
+            "unit": unit,
+            "has_unit": bool(unit),
+            "base_value": val * _NUM_UNIT_SCALE[unit],
+            "source": "llm",
+        })
+    return out
+
+
+def _nf_signature(f: Dict[str, Any]) -> Tuple[str, Any]:
+    """把一条数值条件归一成可比较的签名，用于判断两路解析是否一致。
+
+    只比「运算符 + 换算到基本单位后的阈值」，不比列名：
+    规则路的列名是用户原话里的指标名（GDP），模型路给的是模板列名
+    （GDP总量（亿元）），两者本来就不会字面相同，比列名等于每条都判冲突。
+    「5 万亿」与「50000 亿」换算后都是 5e12，视为同一条件，不算冲突。
+    """
+    op = str(f.get("op") or "").strip()
+    base = f.get("base_value")
+    if base is None:
+        raw = str(f.get("value", "")).replace(",", "").strip()
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return (op, raw)
+        unit = str(f.get("unit") or "").strip()
+        base = val * _NUM_UNIT_SCALE.get(unit, 1)
+    try:
+        return (op, round(float(base), 6))
+    except (TypeError, ValueError):
+        return (op, base)
+
+
+def merge_numeric_filters(
+    rule_filters: List[Dict[str, Any]],
+    llm_filters: List[Dict[str, Any]],
+    col_names: List[str],
+) -> Tuple[List[Dict[str, Any]], str]:
+    """规则与 LLM 双路取并：规则优先，规则落不了地时用 LLM 兜底。
+
+    为什么要两条路：规则精确、可解释、零成本，但只认固定句式；
+    LLM 能听懂「达到五万亿」「GDP 别低于五万亿」这类变体，却可能幻觉。
+    因此规则命中就用规则；规则没解析出（或解析出的落不到模板列）才启用 LLM，
+    并把来源标出来，便于在结果页提示「该条件由模型解析，请核对」。
+
+    返回的第二项是来源标记：
+      rule          规则解析，且与模型一致（或模型没给出条件）
+      rule_conflict 两路都给出了条件但阈值/运算符不同 —— 仍按规则执行，但必须提示用户核对。
+                    静默采信任何一路都是错的：规则可能误匹配了指标名，模型可能编了阈值。
+      llm           规则落不了地，由模型解析
+      none          两路都没有可用条件
+    """
+    rule_ok = usable_numeric_filters(rule_filters or [], col_names)
+    llm_ok = usable_numeric_filters(llm_filters or [], col_names)
+    if rule_ok:
+        if llm_ok:
+            r_sig = {_nf_signature(f) for f in rule_ok}
+            l_sig = {_nf_signature(f) for f in llm_ok}
+            if r_sig != l_sig:
+                return rule_ok, "rule_conflict"
+        return rule_ok, "rule"
+    if llm_ok:
+        return llm_ok, "llm"
+    return [], "none"
 
 
 def filter_data(data: List[Dict], filters: Dict) -> List[Dict]:
@@ -1302,11 +1783,11 @@ def _pick_best_header_block_for_sheet(
     """
     ranked: List[Tuple[float, Dict[str, str], int, List[str]]] = []
     for row_1based, labels in cand_rows:
-        nonempty = [x for x in labels if x]
-        if len(nonempty) < 3:
+        if not _is_plausible_header_row(labels):
             continue
         columns = _columns_from_label_list(labels)
-        if len([c for c in columns if not str(c).startswith("col_")]) < 3:
+        # 与 _is_plausible_header_row 对齐：两列表格同样有效
+        if len([c for c in columns if not str(c).startswith("col_")]) < 2:
             continue
         col_map, sem = _build_semantic_mapping(template_columns, columns, min_score=min_score)
         if sem < 0.06 and len(col_map) < 1:
@@ -1594,17 +2075,19 @@ def try_weak_table_source(template_unique_columns: List[str], file_list: List[Di
     return None
 
 
-def find_best_data_source(template_columns: List[str], uploaded_files: List[Dict]) -> Optional[Dict]:
-    """找到与模板列名最匹配的数据源文件。
-    
-    uploaded_files: [{"id": N, "file_name": "...", "file_path": "...", "file_type": "xlsx/docx"}]
-    返回最佳匹配的文件信息 + 列名映射
-    优先选择有实际数据的 xlsx 文件
+def find_data_source_candidates(
+    template_columns: List[str], uploaded_files: List[Dict], top_k: int = 5
+) -> List[Dict]:
+    """按匹配分返回候选数据源（最多 top_k 个），供上层做「打平时由模型仲裁」。
+
+    拆出来是因为：只按列名打分无法区分「2024年城市数据」和「2025年城市数据」——
+    两者列名完全相同、得分都是 0.928，取排序第一个等于按上传顺序随机选。
+    上层拿到候选列表后才能用用户要求去判断。
     """
     candidates: List[Dict] = []
     if not uploaded_files:
         logger.warning("[find_best] 没有上传文件")
-        return None
+        return []
 
     if len(uploaded_files) == 1:
         candidates.extend(_collect_candidates_for_file(template_columns, uploaded_files[0]))
@@ -1624,9 +2107,20 @@ def find_best_data_source(template_columns: List[str], uploaded_files: List[Dict
             "请查看上方各文件的 [find_best] skip 日志（reason=...）。"
             "常见原因：路径无效、类型非表格、xlsx 列数<=1、docx 表无数据行。"
         )
-        return None
+        return []
     candidates.sort(key=lambda x: (x["match_score"], x.get("priority", 0)), reverse=True)
-    best = candidates[0]
+    return candidates[: max(1, top_k)]
+
+
+def find_best_data_source(template_columns: List[str], uploaded_files: List[Dict]) -> Optional[Dict]:
+    """找到与模板列名最匹配的数据源文件。
+
+    uploaded_files: [{"id": N, "file_name": "...", "file_path": "...", "file_type": "xlsx/docx"}]
+    返回最佳匹配的文件信息 + 列名映射
+    优先选择有实际数据的 xlsx 文件
+    """
+    cands = find_data_source_candidates(template_columns, uploaded_files, top_k=1)
+    best = cands[0] if cands else None
     logger.info(f"[find_best] 最佳匹配: '{best.get('file_name')}', score={best['match_score']}")
     return best
 

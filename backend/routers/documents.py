@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+import logging
 from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
@@ -12,11 +13,19 @@ from database import get_db, SessionLocal
 from models import FileInfo, DocChunk, ExtractResult, TaskInfo, OperationLog, User, fmt_time
 from config import UPLOAD_DIR
 from routers.auth import get_current_user
+from services.ooxml_compat import normalize_ooxml_inplace
+from services.archive_guard import assert_archive_safe, ArchiveRejected
 from services.document_parser import parse_document
 from services.vector_store import add_chunks, remove_file
 from services.extractor import hybrid_extract, rule_extract
 
+# 上传限额：此前用 await file.read() 一次性读入内存，一个大文件就能把进程打满。
+_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+
+
 router = APIRouter(prefix="/api/documents", tags=["文档管理"])
+
+logger = logging.getLogger("documents")
 
 
 def _unique_display_name(original_name: str, existing_names: set) -> str:
@@ -56,6 +65,22 @@ def _fast_parse(file_id: int, file_path: str, task_id: int, upload_ts: float = 0
         db.commit()
 
         chunks = parse_document(file_path)
+        if not chunks:
+            # 文件损坏（如 xlsx 无有效工作表）、空文件或格式不受支持时，
+            # 不能标记 done —— 否则用户以为解析成功，后续抽取/填表拿到的是空内容
+            elapsed = round(time.time() - t_start, 2)
+            fi.parse_status = "error"
+            fi.parse_time = elapsed
+            fi.chunk_count = 0
+            fi.field_count = 0
+            if task:
+                task.status = "error"
+                task.elapsed = elapsed
+                task.end_time = datetime.now()
+                task.result_summary = "未解析到任何内容：文件可能损坏、为空或格式不受支持"
+            db.commit()
+            logger.warning(f"[parse] 未解析到任何内容: {fi.file_name} ({file_path})")
+            return
         for ch in chunks:
             db.add(DocChunk(file_id=file_id, chunk_index=ch["chunk_index"], chunk_text=ch["chunk_text"], chunk_type=ch["chunk_type"], source_position=ch["source_position"]))
         db.commit()
@@ -178,18 +203,38 @@ async def upload(files: List[UploadFile] = File(...), bg: BackgroundTasks = Back
         if ext not in (".docx", ".doc", ".md", ".xlsx", ".xls", ".txt"):
             results.append({"file": f.filename, "status": "error", "message": f"不支持: {ext}"})
             continue
-        display_name = _unique_display_name(f.filename, used_names)
+        # 上传文件名来自客户端，必须按 basename 收口；
+        # 否则 name="../../evil.docx" 会跳出 uploads/ 写到任意位置。
+        _raw_name = os.path.basename((f.filename or "upload").replace("\\", "/")) or "upload"
+        display_name = _unique_display_name(_raw_name, used_names)
         used_names.add(display_name)
         disk_name = f"{uuid.uuid4().hex[:8]}_{display_name}"
         path = UPLOAD_DIR / disk_name
-        content = await f.read()
+        content = await f.read(_MAX_UPLOAD_BYTES + 1)
+        if len(content) > _MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"文件超过 {_MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限")
         with open(path, "wb") as fp:
             fp.write(content)
+        # 解压炸弹闸门：上传限额只管压缩后体积，600KB 的包可以声明解压出 200MB。
+        # 必须在落盘后、任何 openpyxl/python-docx 打开之前拦下。
+        try:
+            assert_archive_safe(path, display_name=display_name)
+        except ArchiveRejected as ae:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            results.append({"file": f.filename, "status": "error", "message": str(ae)})
+            continue
+        # Excel/Word 的 Strict Open XML 变体 openpyxl/python-docx 读不了，
+        # 会在解析阶段表现成「文件里没有内容」。落盘即转成 Transitional。
+        if normalize_ooxml_inplace(str(path)):
+            logger.info(f"[upload] {display_name} 为 Strict OOXML，已就地转换为 Transitional")
         fi = FileInfo(file_name=display_name, file_type=ext.lstrip("."), file_path=str(path), file_size=len(content), upload_user=user.id)
         db.add(fi)
         db.commit()
         db.refresh(fi)
-        task = TaskInfo(task_type="parse", task_name=f"解析: {f.filename}", status="pending", user_id=user.id, related_id=fi.id)
+        task = TaskInfo(task_type="parse", task_name=f"解析: {display_name}", status="pending", user_id=user.id, related_id=fi.id)
         db.add(task)
         db.commit()
         db.refresh(task)
@@ -237,7 +282,7 @@ async def extract_all(db: Session = Depends(get_db), user: User = Depends(get_cu
             results.append({"file_id": fi.id, "file_name": fi.file_name, "status": "done", **r})
         except Exception as e:
             results.append({"file_id": fi.id, "file_name": fi.file_name, "status": "error", "error": str(e)[:200]})
-    return {"message": f"批量提取完成", "total": len(results), "results": results}
+    return {"message": "批量提取完成", "total": len(results), "results": results}
 
 
 @router.get("/list")

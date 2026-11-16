@@ -5,9 +5,20 @@ import os
 import docx
 import openpyxl
 
+from services.archive_guard import assert_archive_safe
 from services.legacy_doc import convert_doc_to_docx_temp, is_ole_doc, is_zip_file
 
 CHUNK_MAX = 800
+
+# 大表索引上限：每张工作表最多把多少数据行写进检索索引。
+# 旧实现只索引「前 50 行 + 末 10 行」，一张 38,000 行的表在聊天里只能检索到
+# 前 50 行，问「第 9000 行的病例数」必然答不出，用户看到的是「文档里没有」——
+# 这比慢更糟，因为它把「没索引」伪装成「没数据」。
+# 上限取 24000 行，覆盖常见业务表；超出部分显式截断，
+# 并写一条说明 chunk，让模型知道「还有数据没索引」，而不是笃定没有。
+# 注意：分批已改为「按字符预算」（见 _sheet_matrix_to_chunks），
+# 不再有固定的每批行数——宽表每批行数会自然变少，窄表变多，但不会有行被丢掉。
+MAX_INDEX_ROWS_PER_SHEET = 24000
 
 
 def parse_document(file_path: str) -> List[Dict[str, Any]]:
@@ -16,6 +27,10 @@ def parse_document(file_path: str) -> List[Dict[str, Any]]:
     parser = parsers.get(ext)
     if not parser:
         raise ValueError(f"不支持的文件类型: {ext}")
+    # 解压炸弹闸门：必须在下游任何 openpyxl/python-docx 打开文件之前。
+    # 上传时也拦了一次，这里是纵深防御——历史遗留文件、重解析、开放接口写入的
+    # 文件都可能绕过上传路径。
+    assert_archive_safe(file_path)
     return parser(file_path)
 
 
@@ -68,7 +83,10 @@ def _parse_docx(fp: str) -> List[Dict[str, Any]]:
                 raise ValueError("无法解析此 docx 文件")
         from lxml import etree
         zf = zipfile.ZipFile(fp)
-        tree = etree.parse(zf.open("word/document.xml"))
+        # 显式关闭外部实体与 DTD 加载。当前 lxml 6 的默认值恰好也是关闭的，
+        # 但那是库的默认值、不是我们的约束——依赖默认值等于把安全性挂在版本号上。
+        _safe = etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True, huge_tree=False)
+        tree = etree.parse(zf.open("word/document.xml"), _safe)
         ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         chunks = []
         idx = 0
@@ -197,34 +215,71 @@ def _sheet_matrix_to_chunks(sn: str, all_rows: list, idx: int) -> tuple:
         chunks.append({"chunk_index": idx, "chunk_text": "\n".join(summary_lines), "chunk_type": "table", "source_position": f"{sn}-summary"})
         idx += 1
 
-        sample_rows = data_rows[:50] + (data_rows[-10:] if total_data > 60 else [])
-    else:
-        sample_rows = data_rows
-
-    batch_size = 25
-    for start in range(0, len(sample_rows), batch_size):
-        batch = sample_rows[start:start + batch_size]
-        lines = []
-        for ri, row in enumerate(batch, start + 1):
-            vals = [str(c) if c is not None else "" for c in row]
-            if not any(v and v != "None" for v in vals):
-                continue
-            pairs = []
-            for j in range(min(len(header), len(vals))):
-                v = vals[j]
-                if v and v != "None":
-                    h = header[j] if header[j] and header[j] != "None" else f"列{j+1}"
-                    pairs.append(f"{h}: {v}")
-            if pairs:
-                lines.append(f"[行{ri}] " + " | ".join(pairs))
-        if lines:
-            text = f"[{sn}]\n" + "\n".join(lines)
-            if len(text) > CHUNK_MAX * 2:
-                text = text[:CHUNK_MAX * 2]
-            chunks.append({"chunk_index": idx, "chunk_text": text, "chunk_type": "table", "source_position": f"{sn}-r{start+1}-{start+len(batch)}"})
+        # 全量索引（超过上限才截断）。不再只取首尾样例：
+        # 只索引 50 行会让大表深处的数据在聊天里「查不到」，与「没有」无法区分。
+        index_rows = data_rows[:MAX_INDEX_ROWS_PER_SHEET]
+        dropped = total_data - len(index_rows)
+        if dropped > 0:
+            chunks.append({
+                "chunk_index": idx,
+                "chunk_text": (
+                    f"[{sn}] 索引截断说明：本表共 {total_data} 行，已索引前 {len(index_rows)} 行，"
+                    f"其余 {dropped} 行未进入检索索引。涉及这些行的问题请下载原文件查看，"
+                    f"不要据此判断「文档中没有该数据」。"
+                ),
+                "chunk_type": "note",
+                "source_position": f"{sn}-truncated",
+            })
             idx += 1
-    return chunks, idx
+    else:
+        index_rows = data_rows
 
+    # 按「字符预算」分批，而不是固定行数。
+    # 旧实现固定 INDEX_BATCH_ROWS=40 行一批，再用 `text[:CHUNK_MAX*2]` 硬截断：
+    # 宽表（如 COVID 15 列、每行约 280 字）一批 40 行 ≈ 11000 字，远超 1600 字上限，
+    # 结果每批只留下前 5~6 行，其余行被静默丢弃——MAX_INDEX_ROWS_PER_SHEET=24000
+    # 的承诺实际不成立（实测 38473 行只索引进约 4800 行），且没有截断提示。
+    # 现在改为「攒到接近上限就切批」，每行都保留，只增加批次数。
+    _line_limit = CHUNK_MAX * 2
+
+    def _flush(buf_lines: list, buf_start: int, buf_end: int) -> None:
+        nonlocal idx
+        if not buf_lines:
+            return
+        chunks.append({
+            "chunk_index": idx,
+            "chunk_text": f"[{sn}]\n" + "\n".join(buf_lines),
+            "chunk_type": "table",
+            "source_position": f"{sn}-r{buf_start}-{buf_end}",
+        })
+        idx += 1
+
+    _buf: List[str] = []
+    _buf_start = 0
+    _buf_len = 0
+    for ri, row in enumerate(index_rows, start=1):
+        vals = [str(c) if c is not None else "" for c in row]
+        if not any(v and v != "None" for v in vals):
+            continue
+        pairs = []
+        for j in range(min(len(header), len(vals))):
+            v = vals[j]
+            if v and v != "None":
+                h = header[j] if header[j] and header[j] != "None" else f"列{j+1}"
+                pairs.append(f"{h}: {v}")
+        if not pairs:
+            continue
+        line = f"[行{ri}] " + " | ".join(pairs)
+        # 单行就超预算时单独成块（宁可超一点，也不能把这行丢掉）
+        if _buf and _buf_len + len(line) + 1 > _line_limit:
+            _flush(_buf, _buf_start, ri - 1)
+            _buf, _buf_len = [], 0
+        if not _buf:
+            _buf_start = ri
+        _buf.append(line)
+        _buf_len += len(line) + 1
+    _flush(_buf, _buf_start, len(index_rows))
+    return chunks, idx
 
 def _parse_xls(fp: str) -> List[Dict[str, Any]]:
     """Excel 97-2003 .xls（openpyxl 不支持，需 xlrd）。"""
@@ -248,22 +303,11 @@ def _parse_xls(fp: str) -> List[Dict[str, Any]]:
 
 
 def _parse_xlsx(fp: str) -> List[Dict[str, Any]]:
-    wb = openpyxl.load_workbook(fp, data_only=True, read_only=True)
     chunks = []
     idx = 0
-    fallback_needed = False
-    for sn in wb.sheetnames:
-        ws = wb[sn]
-        first_row = None
-        for row in ws.iter_rows(max_row=1, values_only=True):
-            first_row = list(row)
-            break
-        if first_row and sum(1 for v in first_row if v is not None) <= 1:
-            fallback_needed = True
-            break
-    wb.close()
-
-    # 用非 read_only 模式重新打开，以便正确处理合并单元格
+    # 直接用非 read_only 模式打开：合并单元格在只读模式下拿不到值。
+    # 原先还有一次「只读预扫描 → 判断 fallback_needed → 重开」的流程，
+    # 但那个标记从未被使用，等于每次解析都白开一遍工作簿（大表上是实打实的开销）。
     wb = openpyxl.load_workbook(fp, data_only=True)
 
     for sn in wb.sheetnames:

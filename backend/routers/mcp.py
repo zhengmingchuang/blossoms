@@ -1,6 +1,6 @@
 import json
 import asyncio
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from database import get_db
@@ -30,16 +30,20 @@ async def sse(request: Request):
 @router.post("/message")
 async def message(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
-    uid = None
+    # 必须携带有效 JWT。此前未鉴权时 uid=None，而下游工具普遍用 `if user_id:`
+    # 做归属过滤——None 会让过滤整体跳过，等于匿名读写全库。
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        try:
-            import jwt
-            from config import SECRET_KEY
-            p = jwt.decode(auth[7:], SECRET_KEY, algorithms=["HS256"])
-            uid = p.get("uid")
-        except Exception:
-            pass
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "MCP 需要 Authorization: Bearer <token>")
+    try:
+        import jwt
+        from config import SECRET_KEY
+        _p = jwt.decode(auth[7:], SECRET_KEY, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(401, "MCP 令牌无效或已过期")
+    uid = _p.get("uid")
+    if not uid:
+        raise HTTPException(401, "MCP 令牌缺少用户标识")
     return JSONResponse(await handle_jsonrpc(body, user_id=uid))
 
 

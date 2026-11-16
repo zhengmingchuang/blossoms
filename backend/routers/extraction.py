@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import get_db
-from models import ExtractResult, FileInfo, DocChunk, User, fmt_time
+from models import ExtractResult, FileInfo, User, fmt_time
 from routers.auth import get_current_user
 from services.fusion import fuse
 

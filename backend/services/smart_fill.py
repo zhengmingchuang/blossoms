@@ -19,7 +19,6 @@ from typing import Optional, Tuple, List, Dict, Any
 import logging
 
 import openpyxl
-from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger("smart_fill")
 

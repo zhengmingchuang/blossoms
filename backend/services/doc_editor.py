@@ -1,10 +1,8 @@
 """文档智能操作引擎 - 通过自然语言指令执行文档编辑、排版、格式调整、内容提取"""
 import os
 import re
-import copy
 import json
 import logging
-from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("doc_editor")
@@ -28,6 +26,30 @@ def _replace_in_paragraph(para, target: str, value: str) -> int:
             else:
                 run.text = ""
     return count
+
+
+def _coerce_cell_value(val):
+    """写入单元格前把「数字样子的字符串」转成数字。
+
+    模型走工具时经常把数值当字符串传（"270"），直接写进 xlsx 就是文本单元格：
+    单元格左上角带绿三角、SUM 求和结果为 0，用户拿到的表算不了。
+    只转纯数字（可带小数/负号），且不转有前导零或超长的（工号、编号、身份证
+    这类必须保持文本，转成数字会丢前导零、丢精度）。
+    """
+    if not isinstance(val, str):
+        return val
+    s = val.strip()
+    if not s or len(s) > 12:
+        return val
+    if not re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return val
+    if len(s) > 1 and s.lstrip("-").startswith("0") and not s.lstrip("-").startswith("0."):
+        return val
+    try:
+        f = float(s)
+    except ValueError:
+        return val
+    return int(f) if f == int(f) and "." not in s else f
 
 
 def edit_docx_content(file_path: str, operations: List[Dict]) -> Dict[str, Any]:
@@ -89,7 +111,7 @@ def edit_xlsx_content(file_path: str, operations: List[Dict]) -> Dict[str, Any]:
         ws = wb[sn]
         if action == "set_cell":
             coord = op.get("cell", "")
-            val = op.get("value", "")
+            val = _coerce_cell_value(op.get("value", ""))
             if coord:
                 ws[coord] = val
                 results.append({"action": action, "cell": f"{sn}!{coord}", "value": val})
@@ -761,12 +783,16 @@ async def extract_from_file(file_id: int, fields: Optional[List[str]] = None) ->
 AGENT_TOOLS = [
     {
         "name": "search_documents",
-        "description": "在用户上传的所有文档中搜索与查询相关的内容片段。用于回答文档内容问题、查找特定信息。",
+        "description": "在用户上传的文档中搜索与查询相关的内容片段。用于回答文档内容问题、查找特定信息。用户指明某一份文档时，务必传 file_id 只在该文档内搜索。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "搜索查询关键词"},
                 "top_k": {"type": "integer", "description": "返回结果数量", "default": 8},
+                "file_id": {
+                    "type": "integer",
+                    "description": "可选。限定只在该文件内搜索；用户说「这份文档」时必须传，否则会搜到其它文档",
+                },
             },
             "required": ["query"],
         },
@@ -876,6 +902,70 @@ AGENT_TOOLS = [
                 },
             },
             "required": ["file_name", "data"],
+        },
+    },
+    {
+        "name": "create_document",
+        "description": "从零创建一份 Word 报告（.docx）：标题、章节标题、正文段落、Word 表格、图表（饼图/折线图/柱状图/条形图，直接渲染成图片嵌入文档）。用户要求「形成文档/报告/正式材料」时用它，而不是只把表格贴在回复里。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_name": {"type": "string", "description": "文件名，如 '实验报告.docx'"},
+                "title": {"type": "string", "description": "文档标题"},
+                "subtitle": {"type": "string", "description": "副标题，可选"},
+                "sections": {
+                    "type": "array",
+                    "description": "章节列表，按顺序写入文档",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string", "description": "章节标题，如 '一、数据表格'"},
+                            "level": {"type": "integer", "description": "标题级别 1-4，默认 1"},
+                            "paragraphs": {
+                                "type": "array", "items": {"type": "string"},
+                                "description": "正文段落，每项一段",
+                            },
+                            "bullets": {
+                                "type": "array", "items": {"type": "string"},
+                                "description": "要点列表",
+                            },
+                            "table": {
+                                "type": "object",
+                                "description": "该章节的表格",
+                                "properties": {
+                                    "headers": {"type": "array", "items": {"type": "string"}},
+                                    "rows": {"type": "array", "items": {"type": "array", "items": {}}},
+                                    "caption": {"type": "string", "description": "表题，如 '表1 月度销量'"},
+                                },
+                            },
+                            "charts": {
+                                "type": "array",
+                                "description": "该章节的图表，直接嵌入文档",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["pie", "line", "column", "bar"]},
+                                        "title": {"type": "string"},
+                                        "caption": {"type": "string", "description": "图题，如 '图1 销量占比'"},
+                                        "categories": {"type": "array", "items": {"type": "string"}},
+                                        "series": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "values": {"type": "array", "items": {"type": "number"}},
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "required": ["file_name", "title", "sections"],
         },
     },
     {
@@ -1004,6 +1094,70 @@ AGENT_TOOLS = [
 ]
 
 
+def _drop_vectors(file_id: int) -> None:
+    """清掉该文件在向量库里的旧片段（含内存索引与持久化 JSON）。
+
+    只删 doc_chunk 不清向量库，检索仍会命中上一版文本：
+    文件改了名或改了内容，模型引用的是磁盘上已不存在的版本。
+    """
+    try:
+        from services.vector_store import remove_file
+        remove_file(file_id)
+    except Exception as ve:
+        logger.warning(f"[gen] 清理向量索引失败 file_id={file_id}: {ve}")
+
+
+def _upsert_generated_file(db, user_id: int, file_path: str, file_name: str, file_type: str):
+    """登记刚生成/改写的文件：同一用户 + 同一绝对路径只保留一条 FileInfo。
+
+    此前每个生成工具都无条件新插一行，磁盘却写到同一个路径，导致：
+    - 「已修改的文档」里同名条目越堆越多（同一次会话改三次就三条）；
+    - 旧 id 成了同一路径的别名，下载旧 id 拿到的是最新内容；
+    - 旧 id 的 doc_chunk 还留着上一版文本，聊天检索会引用已经不存在的版本。
+    这里改为复用记录：内容变了就作废旧索引（chunk_count 归零），交给调用方重新解析。
+    """
+    from datetime import datetime
+    from models import FileInfo, DocChunk
+
+    abs_path = os.path.abspath(file_path)
+    fi = (
+        db.query(FileInfo)
+        .filter(FileInfo.upload_user == user_id, FileInfo.file_path == abs_path)
+        .order_by(FileInfo.id.desc())
+        .first()
+    )
+    size = os.path.getsize(abs_path)
+    if fi:
+        fi.file_name = file_name
+        fi.file_type = file_type
+        fi.file_size = size
+        fi.upload_time = datetime.now()
+        fi.parse_status = "done"
+        db.query(DocChunk).filter(DocChunk.file_id == fi.id).delete()
+        fi.chunk_count = 0
+        db.commit()
+        db.refresh(fi)
+        _drop_vectors(fi.id)
+        logger.info(f"[gen] 复用文件记录 id={fi.id} name={file_name}（同路径不新建）")
+        return fi
+
+    fi = FileInfo(
+        file_name=file_name,
+        file_type=file_type,
+        file_path=abs_path,
+        file_size=size,
+        upload_user=user_id,
+        upload_time=datetime.now(),
+        parse_status="done",
+        chunk_count=0,
+        field_count=0,
+    )
+    db.add(fi)
+    db.commit()
+    db.refresh(fi)
+    return fi
+
+
 async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
     """执行指定工具，返回 JSON 字符串结果。"""
     from database import SessionLocal
@@ -1015,7 +1169,12 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
             from services.vector_store import search as vs_search
             query = tool_input.get("query", "")
             top_k = tool_input.get("top_k", 8)
-            chunks = vs_search(query, top_k, user_id=user_id)
+            # 用户指明「这份文档」时，工具也必须只搜这一份：
+            # 否则聊天上下文已经限定到该文件，模型一调工具又把旧文档捞回来，
+            # 回答的内容与用户问的文档完全对不上。
+            _fid = tool_input.get("file_id")
+            _scope = {int(_fid)} if isinstance(_fid, int) or str(_fid or "").isdigit() else None
+            chunks = vs_search(query, top_k, user_id=user_id, file_ids=_scope)
             results = []
             for c in chunks[:top_k]:
                 results.append({
@@ -1053,6 +1212,13 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
                 result = edit_xlsx_content(fp, ops)
             else:
                 return json.dumps({"error": f"不支持编辑 {fi.file_type} 格式"})
+            # 内容已改写，旧索引就是错的：不作废的话，下一轮问「刚改的那份」
+            # 模型读到的还是改之前的文本。chunk_count 归零后由调用方重新解析。
+            if not (isinstance(result, dict) and result.get("error")):
+                db.query(DocChunk).filter(DocChunk.file_id == fi.id).delete()
+                fi.chunk_count = 0
+                db.commit()
+                _drop_vectors(fi.id)
             return json.dumps(result, ensure_ascii=False)
 
         elif tool_name == "analyze_document":
@@ -1078,6 +1244,8 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
 
         elif tool_name == "create_spreadsheet":
             fname = tool_input.get("file_name", "new_table.xlsx")
+            # 工具入参来自模型输出，必须按 basename 收口，否则可写出上传目录
+            fname = os.path.basename(str(fname).replace("\\", "/")) or "new_table.xlsx"
             if not fname.endswith(".xlsx"):
                 fname += ".xlsx"
             sheet_name = tool_input.get("sheet_name", "Sheet1")
@@ -1091,22 +1259,34 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
 
             result = create_xlsx(file_path, data, sheet_name)
 
-            from datetime import datetime
-            fi = FileInfo(
-                file_name=fname,
-                file_type="xlsx",
-                file_path=os.path.abspath(file_path),
-                file_size=os.path.getsize(file_path),
-                upload_user=user_id,
-                upload_time=datetime.now(),
-                parse_status="completed",
-                chunk_count=0,
-                field_count=0,
-            )
-            db.add(fi)
-            db.commit()
-            db.refresh(fi)
+            fi = _upsert_generated_file(db, user_id, file_path, fname, "xlsx")
             result["file_id"] = fi.id
+            return json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "create_document":
+            fname = tool_input.get("file_name", "新建文档.docx")
+            fname = os.path.basename(str(fname).replace("\\", "/")) or "新建文档.docx"
+            if not fname.lower().endswith(".docx"):
+                fname += ".docx"
+            spec = {
+                "title": tool_input.get("title") or fname.rsplit(".", 1)[0],
+                "subtitle": tool_input.get("subtitle") or "",
+                "sections": tool_input.get("sections") or [],
+            }
+            if not spec["sections"]:
+                return json.dumps({"error": "sections 不能为空"}, ensure_ascii=False)
+
+            upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads", str(user_id))
+            os.makedirs(upload_dir, exist_ok=True)
+            file_path = os.path.join(upload_dir, fname)
+
+            from services.doc_builder import create_docx_report
+
+            result = create_docx_report(file_path, spec)
+
+            fi = _upsert_generated_file(db, user_id, file_path, fname, "docx")
+            result["file_id"] = fi.id
+            result.pop("file_path", None)
             return json.dumps(result, ensure_ascii=False)
 
         elif tool_name == "format_spreadsheet":
@@ -1147,6 +1327,9 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
             tpl_id = tool_input.get("template_file_id")
             data_id = tool_input.get("data_file_id")
             output_name = tool_input.get("output_name") or ""
+            # 工具入参来自模型输出，必须按 basename 收口：
+            # output_name="../../x.xlsx" 会写出 uploads/<uid>/ 之外。
+            output_name = os.path.basename(str(output_name).replace("\\", "/")) if output_name else ""
             keep_provinces = bool(tool_input.get("keep_province_groups", False))
             sheet_name = tool_input.get("sheet_name") or None
 
@@ -1162,7 +1345,7 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
                 return json.dumps({"error": f"数据源必须为 Excel 文件，当前: {data_fi.file_type}"})
 
             if not output_name:
-                base = os.path.splitext(tpl.file_name)[0]
+                base = os.path.basename(os.path.splitext(tpl.file_name or "template")[0])
                 output_name = f"{base}_已填充.xlsx"
             if not output_name.endswith(".xlsx"):
                 output_name += ".xlsx"
@@ -1170,6 +1353,9 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
             upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads", str(user_id))
             os.makedirs(upload_dir, exist_ok=True)
             output_path = os.path.abspath(os.path.join(upload_dir, output_name))
+            # 纵深防御：即使上面漏了净化，也不允许落到用户目录之外
+            if not output_path.startswith(os.path.abspath(upload_dir) + os.sep):
+                return json.dumps({"error": "非法的输出文件名"}, ensure_ascii=False)
 
             try:
                 fill_res = smart_fill(
@@ -1183,21 +1369,7 @@ async def execute_tool(tool_name: str, tool_input: Dict, user_id: int) -> str:
                 logger.error(f"smart_fill 执行失败: {fe}", exc_info=True)
                 return json.dumps({"error": f"填表失败: {str(fe)[:200]}"})
 
-            from datetime import datetime
-            fi = FileInfo(
-                file_name=output_name,
-                file_type="xlsx",
-                file_path=output_path,
-                file_size=os.path.getsize(output_path),
-                upload_user=user_id,
-                upload_time=datetime.now(),
-                parse_status="completed",
-                chunk_count=0,
-                field_count=0,
-            )
-            db.add(fi)
-            db.commit()
-            db.refresh(fi)
+            fi = _upsert_generated_file(db, user_id, output_path, output_name, "xlsx")
 
             return json.dumps({
                 "ok": True,
