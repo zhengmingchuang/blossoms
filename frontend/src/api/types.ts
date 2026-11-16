@@ -125,6 +125,18 @@ export interface TemplateUploadResult {
 }
 
 /** 填报结果（POST /api/templates/{id}/fill） */
+/** 单位口径待确认项：表头声明了数量级（万元/亿元…）但源值未标单位 */
+export interface UnitConfirmation {
+  column: string
+  header_unit: string
+  base_unit: string
+  target_scale: number
+  affected_rows: number
+  numeric_rows: number
+  samples: string[]
+  options: Array<{ key: 'as_declared' | 'as_base'; label: string; desc: string }>
+}
+
 export interface FillResult {
   message: string
   template_id: number
@@ -136,6 +148,15 @@ export interface FillResult {
   output_file: string
   source_file?: string
   details?: unknown
+  /** 需要人工确认口径的列；为空或未返回表示无歧义项 */
+  unit_confirmations?: UnitConfirmation[]
+  /**
+   * 面向用户的填充告警：筛选条件没落地、某张表/某列没有任何数据、多批读数不一致等。
+   * 后端一直在返回，界面此前没有展示，等于让这些情况静默发生。
+   */
+  warnings?: string[]
+  task_id?: number
+  elapsed_seconds?: number
 }
 
 /** 填报历史条目（GET /api/templates/history） */
@@ -238,7 +259,7 @@ export type ChatStreamEvent =
       session_id: number
       answer: string
       tool_actions?: ToolAction[] | null
-      edited_files?: Array<{ id: number; name: string; type: string }> | null
+      edited_files?: Array<{ id: number; name: string; type: string; key?: string }> | null
     }
   | { type: 'error'; message: string }
 

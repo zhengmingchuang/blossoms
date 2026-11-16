@@ -12,7 +12,15 @@ import globals from 'globals'
  */
 export default [
   {
-    ignores: ['dist/**', 'node_modules/**', 'public/**', 'coverage/**', '*.min.js'],
+    // dist_prev*/ 是旧构建备份（压缩产物），不参与 lint，否则会扫出上千条压缩代码误报
+    ignores: [
+      'dist/**',
+      'dist_prev*/**',
+      'node_modules/**',
+      'public/**',
+      'coverage/**',
+      '*.min.js',
+    ],
   },
 
   js.configs.recommended,

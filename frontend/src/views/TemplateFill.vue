@@ -153,6 +153,77 @@
             </div>
           </div>
           <div v-if="fillResult.source_file" class="source-hint">数据来源: {{ fillResult.source_file }}</div>
+
+          <!-- 处理过程可视化：把「一共等了 15 秒」拆成可解释的几段。
+               后端在关键节点记录耗时，前端只做展示，不参与任何判定。 -->
+          <div v-if="stageList.length" class="stage-timeline">
+            <div class="stage-head">
+              <span>处理过程</span>
+              <span class="stage-total">共 {{ stageTotal }}s</span>
+            </div>
+            <div class="stage-track">
+              <div
+                v-for="(s, i) in stageList"
+                :key="i"
+                class="stage-seg"
+                :style="{ width: stagePct(s) + '%', background: stageColor(i) }"
+                :title="`${s.name}：${s.seconds}s${s.detail ? '（' + s.detail + '）' : ''}`"
+              ></div>
+            </div>
+            <div class="stage-legend">
+              <span v-for="(s, i) in stageList" :key="i" class="stage-legend-item">
+                <i :style="{ background: stageColor(i) }"></i>{{ s.name }} {{ s.seconds }}s
+              </span>
+            </div>
+          </div>
+
+          <!-- 填充告警：条件没落地、某张表没数据、多批读数不一致等。
+               这些以前只写日志，用户看到的是一张「填满了」的表，不知道筛选/某张表其实没生效。 -->
+          <div v-if="fillWarnings.length" class="fill-warn">
+            <div class="fill-warn-head">
+              <el-icon style="font-size: 14px"><WarningFilled /></el-icon>
+              <span>有 {{ fillWarnings.length }} 条提示需要你确认</span>
+            </div>
+            <ul class="fill-warn-list">
+              <li v-for="(w, i) in fillWarnings" :key="i">{{ w }}</li>
+            </ul>
+          </div>
+
+          <!-- 单位口径待确认：数据本身无法判定，必须人工选择后才能当作可信结果 -->
+          <div v-if="unitPending.length" class="unit-confirm">
+            <div class="unit-confirm-head">
+              <el-icon style="font-size: 14px"><InfoFilled /></el-icon>
+              <span>
+                {{ unitPending.length }} 列单位口径无法从数据判定，已按原值写入。请确认后重填：
+              </span>
+            </div>
+            <div v-for="u in unitPending" :key="u.column" class="unit-confirm-row">
+              <div class="unit-confirm-col">
+                <b>{{ u.column }}</b>
+                <span class="unit-confirm-meta">
+                  表头单位 {{ u.header_unit }} · {{ u.affected_rows }}/{{ u.numeric_rows }} 个数值未标单位
+                  <template v-if="u.samples.length"> · 例：{{ u.samples.join('、') }}</template>
+                </span>
+              </div>
+              <el-radio-group v-model="unitChoices[u.column]" size="small">
+                <el-radio-button v-for="o in u.options" :key="o.key" :value="o.key">
+                  {{ o.label }}
+                </el-radio-button>
+              </el-radio-group>
+            </div>
+            <div class="unit-confirm-actions">
+              <span class="unit-confirm-tip">未选择前，该列数值口径不可信，请勿直接用于对外材料。</span>
+              <el-button size="small" @click="dismissUnitConfirm">保持原值</el-button>
+              <el-button
+                type="primary"
+                size="small"
+                :loading="unitApplying"
+                :disabled="!unitChoiceReady"
+                @click="applyUnitChoices"
+                >应用并重填</el-button
+              >
+            </div>
+          </div>
           <div class="result-table-wrap">
             <el-table :data="fillResult.details" size="small" height="100%">
               <el-table-column prop="field" label="字段/列名" width="140" show-overflow-tooltip />
@@ -430,7 +501,7 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { tplApi, docApi } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { UploadFilled, InfoFilled } from '@element-plus/icons-vue'
+import { UploadFilled, InfoFilled, WarningFilled } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const goDocuments = () => router.push({ name: 'Documents' })
@@ -444,6 +515,29 @@ const tplPagedList = computed(() => {
 })
 const uploadResult = ref(null)
 const fillResult = ref(null)
+// 填充告警：条件没落地 / 某张表没数据 / 多批读数不一致。以前后端返回了但界面没展示，
+// 等于「静默」——用户看到的是一张填满的表，不知道其中有几列其实没生效。
+const fillWarnings = computed(() => fillResult.value?.warnings || [])
+// 处理过程可视化：后端返回 [{name, seconds, detail}]，这里只做展示
+const stageList = computed(() => fillResult.value?.stages || [])
+const stageTotal = computed(() =>
+  Math.max(
+    stageList.value.reduce((a, s) => a + (Number(s.seconds) || 0), 0),
+    0.01,
+  ).toFixed(1),
+)
+const stagePct = (s) => Math.max(((Number(s.seconds) || 0) / Number(stageTotal.value)) * 100, 2)
+const STAGE_COLORS = ['#5b8ff9', '#5ad8a6', '#f6bd16', '#e8684a', '#9270ca', '#6dc8ec']
+const stageColor = (i) => STAGE_COLORS[i % STAGE_COLORS.length]
+/** 上一次填表用的模板与数据源，口径重填时复用，避免用户重选 */
+const lastFillMeta = ref({ tid: null, sourceIds: [] })
+/** 单位口径待确认项：{列名: 'as_declared' | 'as_base'} */
+const unitChoices = ref({})
+const unitApplying = ref(false)
+const unitPending = computed(() => fillResult.value?.unit_confirmations || [])
+const unitChoiceReady = computed(
+  () => unitPending.value.length > 0 && unitPending.value.every(u => !!unitChoices.value[u.column]),
+)
 const filling = ref(null)
 const userReq = ref('')
 const mappingVis = ref(false)
@@ -646,9 +740,16 @@ const confirmFill = async () => {
   sourceVis.value = false
   filling.value = row.id
   try {
-    const { data } = await tplApi.fill(row.id, selectedSourceIds.value)
+    const sourceIds = [...selectedSourceIds.value]
+    const { data } = await tplApi.fill(row.id, sourceIds)
     fillResult.value = data
-    ElMessage.success(`填写完成：${data.filled_count}/${data.field_count}`)
+    lastFillMeta.value = { tid: row.id, sourceIds }
+    unitChoices.value = {}
+    if (data.unit_confirmations?.length) {
+      ElMessage.warning(`填写完成，但 ${data.unit_confirmations.length} 列单位口径需确认`)
+    } else {
+      ElMessage.success(`填写完成：${data.filled_count}/${data.field_count}`)
+    }
     loadHistory()
     await loadList()
     if (fromUploadCard) {
@@ -659,6 +760,36 @@ const confirmFill = async () => {
     ElMessage.error('填写失败：' + (e.response?.data?.detail || '请检查数据'))
   } finally {
     filling.value = null
+  }
+}
+
+/** 放弃口径选择：保留原值，仅收起提示（数值未做任何换算） */
+const dismissUnitConfirm = () => {
+  if (fillResult.value) fillResult.value.unit_confirmations = []
+}
+
+/** 按所选口径重填：后端按列换算后重新生成文件 */
+const applyUnitChoices = async () => {
+  const meta = lastFillMeta.value
+  if (!meta.tid || !unitChoiceReady.value) return
+  unitApplying.value = true
+  try {
+    const overrides = {}
+    for (const u of unitPending.value) overrides[u.column] = unitChoices.value[u.column]
+    const { data } = await tplApi.fill(meta.tid, meta.sourceIds, overrides)
+    fillResult.value = data
+    unitChoices.value = {}
+    if (data.unit_confirmations?.length) {
+      ElMessage.warning(`已重填，仍有 ${data.unit_confirmations.length} 列口径需确认`)
+    } else {
+      ElMessage.success('已按所选口径重填完成')
+    }
+    loadHistory()
+    await loadList()
+  } catch (e) {
+    ElMessage.error('重填失败：' + (e.response?.data?.detail || '请稍后重试'))
+  } finally {
+    unitApplying.value = false
   }
 }
 
@@ -1050,6 +1181,132 @@ onBeforeUnmount(stopSrcPolling)
   margin-bottom: 12px;
   font-size: 13px;
   color: var(--text-secondary);
+}
+
+/* 填充告警（条件未落地 / 某表无数据 / 多批读数不一致） */
+.stage-timeline {
+  margin: 10px 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(91, 143, 249, 0.06);
+  border: 1px solid rgba(91, 143, 249, 0.18);
+}
+.stage-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary, #8a8f99);
+  margin-bottom: 6px;
+}
+.stage-total {
+  font-variant-numeric: tabular-nums;
+}
+.stage-track {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.06);
+}
+.stage-seg {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.stage-seg + .stage-seg {
+  margin-left: 1px;
+}
+.stage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary, #8a8f99);
+}
+.stage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.stage-legend-item i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.fill-warn {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e6a23c;
+  border-radius: 8px;
+  background: #fdf6ec;
+}
+.fill-warn-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #b88230;
+  margin-bottom: 6px;
+}
+.fill-warn-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #8a6d3b;
+}
+
+/* 单位口径待确认 */
+.unit-confirm {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #f0c36d;
+  border-radius: 8px;
+  background: #fff9ec;
+}
+.unit-confirm-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #8a5a00;
+  margin-bottom: 8px;
+}
+.unit-confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px dashed #f0d9a8;
+}
+.unit-confirm-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.unit-confirm-meta {
+  font-size: 12px;
+  color: #9a7b3f;
+  word-break: break-all;
+}
+.unit-confirm-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+.unit-confirm-tip {
+  margin-right: auto;
+  font-size: 12px;
+  color: #9a7b3f;
 }
 
 .result-table-wrap {

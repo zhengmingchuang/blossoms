@@ -102,12 +102,14 @@ export const tplApi = {
   upload: (formData: FormData) => api.post<TemplateUploadResult>('/api/templates/upload', formData),
   list: () => api.get<TemplateListResult>('/api/templates/list'),
   /** 填报是长任务，超时单独放宽到 5 分钟 */
-  fill: (id: number, sourceFileIds?: number[]) =>
-    api.post<FillResult>(
-      `/api/templates/${id}/fill`,
-      sourceFileIds ? { source_file_ids: sourceFileIds } : null,
-      { timeout: 300_000 },
-    ),
+  fill: (id: number, sourceFileIds?: number[], unitOverrides?: Record<string, string>) => {
+    const body: Record<string, unknown> = {}
+    if (sourceFileIds?.length) body.source_file_ids = sourceFileIds
+    if (unitOverrides && Object.keys(unitOverrides).length) body.unit_overrides = unitOverrides
+    return api.post<FillResult>(`/api/templates/${id}/fill`, Object.keys(body).length ? body : null, {
+      timeout: 300_000,
+    })
+  },
   mappings: (id: number) =>
     api.get<{ total: number; mappings: Array<Record<string, unknown>> }>(`/api/templates/${id}/mappings`),
   updateRequirement: (id: number, text: string) =>

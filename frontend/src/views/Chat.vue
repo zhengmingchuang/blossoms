@@ -247,7 +247,26 @@ const historyDrawerOpen = ref(false)
 const selectedFileIds = ref([])
 const fileList = ref([])
 const uploading = ref(false)
-const editedDocHistory = ref(JSON.parse(localStorage.getItem('editedDocHistory') || '[]'))
+// 「文档修改记录」的稳定去重键：优先用后端给的磁盘路径；旧数据没有 key 时退化成「文件名+类型」。
+// 只按 id 去重不够——同名文件每次重新生成都是新 id，抽屉里就会堆成十几行一模一样的名字。
+const _docKey = doc => doc.key || `${doc.name}|${doc.type}`
+
+const _dedupeDocHistory = list => {
+  const seen = new Set()
+  const out = []
+  for (const d of list) {
+    if (!d || !d.name) continue
+    const k = _docKey(d)
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push({ ...d, key: k })
+  }
+  return out
+}
+
+const editedDocHistory = ref(
+  _dedupeDocHistory(JSON.parse(localStorage.getItem('editedDocHistory') || '[]')),
+)
 
 const _saveDocHistory = () => {
   const keep = editedDocHistory.value.slice(0, 50)
@@ -257,7 +276,12 @@ const _saveDocHistory = () => {
 const addToDocHistory = ef => {
   const now = new Date()
   const timeStr = `${now.getMonth() + 1}/${now.getDate()} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
-  editedDocHistory.value.unshift({ id: ef.id, name: ef.name, type: ef.type, time: timeStr })
+  const key = _docKey(ef)
+  // 同一份文件改多次只保留最新一条；顺手把没有 key 的旧条目按「名字+类型」并掉
+  editedDocHistory.value = editedDocHistory.value.filter(
+    d => _docKey(d) !== key && !(!d.key && d.name === ef.name && d.type === ef.type),
+  )
+  editedDocHistory.value.unshift({ id: ef.id, name: ef.name, type: ef.type, key, time: timeStr })
   _saveDocHistory()
 }
 
